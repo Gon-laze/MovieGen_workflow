@@ -686,6 +686,78 @@ moviegen run project.yaml --stage benchmark
 
 - 若候选 provider 大面积失败，则重新回到 benchmark
 
+标准测试套件固定为 `benchmark_suite_v1`，不得在同一次 Gate 2 评估中随意变更。  
+该套件默认包含 8 个基准镜头，所有候选 provider 必须跑同一套输入：
+
+- `B01_closeup_emotion`
+  - 单人近景，微表情、呼吸、细微头部运动
+  - 评估重点：面部稳定、细节真实感、微动作自然度
+- `B02_dialogue_ots`
+  - 双人过肩对话，固定场景，连续反打
+  - 评估重点：角色一致性、空间关系、对白镜头语法
+- `B03_walk_and_talk`
+  - 角色移动中的中景叙事镜头
+  - 评估重点：步态稳定、背景连续性、镜头跟随自然度
+- `B04_hand_object_interaction`
+  - 手与关键道具交互
+  - 评估重点：手部结构、接触关系、动作逻辑
+- `B05_vertical_rise_establishing`
+  - 大场面建立镜头，近地到高空的垂直上升
+  - 评估重点：大位移稳定性、透视连贯性、环境一致性
+- `B06_reference_consistency`
+  - 使用角色/道具/场景参考图的中景镜头
+  - 评估重点：参考遵循度、角色/道具复现、风格统一
+- `B07_motion_control_stress`
+  - 动作迁移或 motion control 压力测试
+  - 评估重点：动作可控性、姿态漂移、复杂运动稳定性
+- `B08_task_ceiling_stress`
+  - 复杂任务压力测试：多镜头叙事、长时序连续性、复杂调度
+  - 评估重点：任务上限、长时序组织能力、多镜头逻辑
+
+评分维度固定采用 10 分制，并按以下权重计算 `weighted_total_score`：
+
+- `task_ceiling`：0.25
+- `continuity`：0.20
+- `motion_stability`：0.15
+- `identity_consistency`：0.15
+- `instruction_fidelity`：0.10
+- `camera_control`：0.10
+- `cost_efficiency`：0.05
+
+其中 `task_ceiling` 的定义固定为：
+
+- 面向复杂任务的综合表现，而不是单镜头平均质量
+- 包括：多镜头叙事、长时序衔接、角色与场景跨镜头复用、复杂调度不崩坏
+
+Gate 2 的固定判定规则如下：
+
+- `Seedance 2.0` 与 `Kling 3.0 系列` 必须始终进入最高优先级 benchmark 阶段，不允许在运行前被排除
+- 若某 provider 的 `weighted_total_score < 7.5`，则不得进入主生产池
+- 若某 provider 的 `task_ceiling < 8.0`，则不得作为“主叙事镜头生产第一梯队”
+- 若 `Seedance 2.0` 与 `Kling 3.0` 的总分差值 `<= 0.4`，则二者同时保留为第一梯队
+- 若其中一方在某个专项维度上领先 `>= 0.8`，则该专项维度对应的镜头标签优先路由给胜者
+
+专项优先判定规则固定如下：
+
+- `Seedance 2.0` 若在 `task_ceiling / continuity / instruction_fidelity` 中任意两项领先，则优先承担：
+  - `narrative_multi_shot`
+  - `scene_transition`
+  - `reference_storytelling`
+- `Kling 3.0` 若在 `motion_stability / camera_control / identity_consistency` 中任意两项领先，则优先承担：
+  - `motion_control`
+  - `action_heavy`
+  - `pose_transfer`
+  - `element_reference`
+
+`Benchmark Runner` 的产出必须新增以下结构化字段：
+
+- `benchmark_suite_id`
+- `provider_scores`
+- `provider_rankings`
+- `archetype_winners`
+- `tier_assignments`
+- `routing_recommendation`
+
 #### 5. `Story & Shot Planning`
 
 目的：  
@@ -810,6 +882,100 @@ moviegen run project.yaml --stage route
 
 - 预算超阈值时自动降级或暂停等待确认
 
+`Provider Router` 的默认目标不是“平均分配”，而是“按镜头标签把镜头送给最擅长的模型”。  
+镜头在进入 router 前必须具备以下最小标签：
+
+- `grade`: `A / B / C`
+- `archetype`: 例如 `hero_cinematic`、`narrative_multi_shot`、`motion_control`、`reference_consistency`、`dialogue_native_audio`、`insert_cutaway`
+- `needs_native_audio`: `true / false`
+- `needs_reference_consistency`: `true / false`
+- `needs_motion_control`: `true / false`
+- `duration_target_sec`
+
+默认路由矩阵固定如下：
+
+- `hero_cinematic`
+  - primary: `veo_3_1`
+  - secondary: `veo_3_1_fast`
+  - fallback: `runway_gen_4_5`
+- `narrative_multi_shot`
+  - primary: `seedance_2_0`
+  - secondary: `kling_3_0`
+  - fallback: `runway_gen_4`
+- `reference_storytelling`
+  - primary: `seedance_2_0`
+  - secondary: `vidu_q3`
+  - fallback: `kling_3_0`
+- `motion_control`
+  - primary: `kling_3_0`
+  - secondary: `seedance_2_0`
+  - fallback: `runway_gen_4`
+- `action_heavy`
+  - primary: `kling_3_0`
+  - secondary: `runway_gen_4`
+  - fallback: `seedance_2_0`
+- `dialogue_native_audio`
+  - primary: `vidu_q3`
+  - secondary: `seedance_2_0`
+  - fallback: `kling_3_0`
+- `reference_consistency`
+  - primary: `vidu_q3`
+  - secondary: `kling_3_0`
+  - fallback: `seedance_2_0`
+- `insert_cutaway`
+  - primary: `vidu_q3`
+  - secondary: `hailuo_current`
+  - fallback: `wan`
+
+第一梯队的强制规则固定如下：
+
+- 所有 `B` 池中带有 `narrative_multi_shot`、`reference_storytelling`、`motion_control`、`action_heavy` 标签的镜头，必须优先尝试 `Seedance 2.0` 或 `Kling 3.0`
+- 只有在以下条件之一满足时，才允许把该类镜头直接降到第二梯队：
+  - 对应第一梯队 provider 在最近一次 `benchmark_suite_v1` 中专项分数 `< 8.0`
+  - 当前 provider 队列超时且预计等待时间超过 `max_queue_wait_min`
+  - 当前项目预算已进入 `budget_warning`，且该镜头被标为 `non_hero`
+
+路由优先级冲突时，按以下规则裁决：
+
+- 若镜头同时命中 `narrative_multi_shot` 与 `motion_control`
+  - 先比较 Gate 2 中 `task_ceiling` 与 `motion_stability` 的专项胜者
+  - 若 `task_ceiling` 差值 `>= 0.8`，给 `Seedance 2.0`
+  - 若 `motion_stability` 差值 `>= 0.8`，给 `Kling 3.0`
+  - 否则双投：同镜头同时向 `Seedance 2.0` 与 `Kling 3.0` 各提交 1 轮
+- 若镜头同时命中 `reference_consistency` 与 `dialogue_native_audio`
+  - 先给 `Vidu Q3`
+  - 若 Vidu 未过 `JudgeScore` 阈值，再回流到 `Seedance 2.0`
+
+`Provider Router` 的预算控制规则固定如下：
+
+- `A` 池镜头不允许直接路由到 `C` 池 provider
+- `B` 池镜头默认最多允许双投 2 个 provider
+- `C` 池镜头禁止使用 `veo_3_1`
+- 当预算达到 `80%`：
+  - `A` 池仍可使用第一梯队
+  - `B` 池禁止无条件双投
+  - `C` 池强制下沉到低成本 provider
+- 当预算达到 `90%`：
+  - `A` 池镜头必须人工确认才允许继续使用 `veo_3_1 / runway_gen_4_5`
+  - `B` 池镜头默认只保留单投
+
+`Provider Router` 的队列与重试规则固定如下：
+
+- `max_queue_wait_min` 默认设为 `20`
+- 任一 provider 在同类镜头上连续失败 `>= 3` 次，则临时熔断 `30` 分钟
+- 熔断期间同类镜头自动切换到 secondary
+- 若 primary 与 secondary 同时失败，则回流 `compile-prompts`，并给 `PromptCompiler` 加上 `retry_context`
+
+`Provider Router` 的输出必须新增以下结构化字段：
+
+- `selected_provider`
+- `provider_rank`
+- `route_reason`
+- `archetype`
+- `fallback_chain`
+- `budget_class`
+- `queue_policy`
+
 #### 8. `Generation Adapters`
 
 目的：  
@@ -891,6 +1057,121 @@ moviegen run project.yaml --stage judge
 失败处理：
 
 - 低分镜头自动回流 `compile-prompts -> route -> generate`
+
+`AI Judge` 的目标不是替代导演，而是把“明显不合格的候选镜头”尽早拦在人工看片之前。  
+因此评分必须同时输出：
+
+- 数值评分
+- 决策标签
+- 回流建议
+- 硬失败原因
+
+`JudgeScore` 的评分维度固定为 10 分制，默认字段如下：
+
+- `identity_consistency`
+- `scene_consistency`
+- `instruction_fidelity`
+- `motion_stability`
+- `camera_language`
+- `image_quality`
+- `audio_sync`
+- `narrative_utility`
+- `artifact_penalty`
+- `weighted_total_score`
+
+其中 `artifact_penalty` 为惩罚项，取值范围 `0.0 - 3.0`，用于扣减总分。  
+`weighted_total_score` 默认计算方式固定为：
+
+- `identity_consistency * 0.18`
+- `scene_consistency * 0.14`
+- `instruction_fidelity * 0.14`
+- `motion_stability * 0.14`
+- `camera_language * 0.10`
+- `image_quality * 0.12`
+- `audio_sync * 0.08`
+- `narrative_utility * 0.10`
+- 减去 `artifact_penalty`
+
+若镜头未要求原生音频，则 `audio_sync` 不参与加权，剩余权重按比例归一。
+
+硬失败条件固定如下，只要命中任一项，直接标记 `hard_fail=true`：
+
+- 主体身份明显崩坏，无法判定为同一角色
+- 关键道具或关键场景锚点消失
+- 运动逻辑断裂，出现明显空间穿模或肢体崩坏
+- 需要 lip-sync 的镜头但口型严重不匹配
+- 帧间闪烁、扭曲、鬼影达到不可用程度
+- 出现平台水印、错误字幕、明显 UI 残留
+
+按镜头等级的决策阈值固定如下：
+
+- `A` 池
+  - `pass`: `weighted_total_score >= 8.4` 且无硬失败
+  - `review`: `7.8 - 8.39`
+  - `regenerate`: `< 7.8` 或硬失败
+- `B` 池
+  - `pass`: `weighted_total_score >= 7.8` 且无硬失败
+  - `review`: `7.2 - 7.79`
+  - `regenerate`: `< 7.2` 或硬失败
+- `C` 池
+  - `pass`: `weighted_total_score >= 7.0` 且无硬失败
+  - `review`: `6.5 - 6.99`
+  - `regenerate`: `< 6.5` 或硬失败
+
+`AI Judge` 的输出决策固定为以下枚举之一：
+
+- `pass`
+- `review`
+- `regenerate_same_provider`
+- `reroute_provider`
+- `send_to_post_fix`
+- `reject`
+
+默认决策规则如下：
+
+- 若 `hard_fail=true` 且问题属于结构性问题：
+  - `reroute_provider`
+- 若 `hard_fail=true` 且问题属于局部瑕疵：
+  - `regenerate_same_provider`
+- 若总分落入 `review` 区间：
+  - `review`
+- 若总分已过线但仅存在轻微后期问题：
+  - `send_to_post_fix`
+- 若总分过线且无关键风险：
+  - `pass`
+
+问题类型与回流阶段映射固定如下：
+
+- `identity drift` -> `compile-prompts`
+- `reference mismatch` -> `compile-prompts`
+- `motion collapse` -> `route`
+- `camera mismatch` -> `compile-prompts`
+- `provider artifact` -> `generate`
+- `minor flicker / sharpen / sync issues` -> `post`
+
+`AI Judge` 必须新增以下结构化输出字段：
+
+- `judge_score_id`
+- `candidate_clip_id`
+- `shot_id`
+- `grade`
+- `provider`
+- `metrics`
+- `weighted_total_score`
+- `hard_fail`
+- `hard_fail_reasons`
+- `decision`
+- `route_back_stage`
+- `judge_model`
+- `judge_prompt_version`
+- `created_at`
+
+`Gate 3` 的默认筛选规则固定如下：
+
+- 每个 `ShotSpec` 至少保留 `top 2` 候选给人工看
+- 若第一名与第二名分差 `< 0.4`，必须双入围
+- 若第一名来自第一梯队 provider，而第二名来自第二梯队 provider 且分差 `< 0.2`，也必须双入围
+- 若所有候选都未过 `review` 下限，则该镜头不进入 Gate 3，而是自动回流
 
 #### 10. `Continuity Checker`
 
@@ -1054,6 +1335,103 @@ SQLite 至少记录以下表：
 - `budget_ledger`
 - `human_gates`
 - `artifacts`
+
+各表的最小职责固定如下：
+
+- `runs`
+  - 记录一次完整工作流执行
+  - 关键字段：`run_id`、`project_id`、`status`、`started_at`、`finished_at`
+- `stage_runs`
+  - 记录每个 stage 在某次 `run_id` 下的执行情况
+  - 关键字段：`run_id`、`stage_name`、`status`、`attempt`、`started_at`、`finished_at`
+- `generation_jobs`
+  - 记录所有实际发往 provider 的任务
+  - 关键字段：`job_id`、`shot_id`、`provider`、`provider_model`、`status`、`external_job_id`
+- `candidate_clips`
+  - 记录下载回来的候选片段
+  - 关键字段：`candidate_clip_id`、`job_id`、`shot_id`、`provider`、`artifact_path`
+- `judge_scores`
+  - 记录每个候选片段的评分结果
+  - 关键字段：`judge_score_id`、`candidate_clip_id`、`weighted_total_score`、`decision`
+- `budget_ledger`
+  - 记录预算消耗与冻结额度
+  - 关键字段：`run_id`、`provider`、`estimated_cost_usd`、`actual_cost_usd`、`event_type`
+- `human_gates`
+  - 记录 Gate 1-4 的状态与人工决策
+  - 关键字段：`gate_id`、`run_id`、`gate_name`、`status`、`decision_payload`
+- `artifacts`
+  - 统一索引所有中间产物与最终产物
+  - 关键字段：`artifact_id`、`run_id`、`artifact_type`、`artifact_path`、`source_stage`
+
+状态枚举固定如下：
+
+- `runs.status`
+  - `created`
+  - `running`
+  - `paused_for_gate`
+  - `failed`
+  - `completed`
+  - `canceled`
+- `stage_runs.status`
+  - `pending`
+  - `running`
+  - `succeeded`
+  - `failed`
+  - `skipped`
+- `generation_jobs.status`
+  - `queued`
+  - `running`
+  - `succeeded`
+  - `failed`
+  - `timed_out`
+  - `canceled`
+- `human_gates.status`
+  - `waiting`
+  - `approved`
+  - `rejected`
+  - `expired`
+
+状态迁移规则固定如下：
+
+- `runs.created -> runs.running`
+  - 在第一阶段真正启动时发生
+- `runs.running -> runs.paused_for_gate`
+  - 任一 Gate 进入等待人工确认时发生
+- `runs.paused_for_gate -> runs.running`
+  - Gate 被批准后恢复执行
+- `runs.running -> runs.failed`
+  - 任一关键 stage 失败且无自动恢复路径时发生
+- `runs.running -> runs.completed`
+  - 所有目标 stage 成功结束时发生
+- `runs.running -> runs.canceled`
+  - 用户主动取消或预算硬停时发生
+
+`stage_runs` 的强约束规则固定如下：
+
+- 同一 `run_id + stage_name` 在同一时间最多只能有一个 `running`
+- 后续 stage 不得在前序强依赖 stage `failed` 的情况下进入 `running`
+- `judge` 不得早于 `generate`
+- `route` 不得早于 `compile-prompts`
+- `benchmark` 不得在 `Gate 1` 未批准时进入 `succeeded`
+
+`generation_jobs` 的强约束规则固定如下：
+
+- 同一 `packet_id` 在同一 provider 上的并发 job 数默认不超过 `2`
+- 同一 `shot_id` 的 `A` 池镜头必须至少保留一条完整 `job -> clip -> judge` 轨迹
+- 任一 `generation_job` 在 `succeeded` 前不得写入最终 `actual_cost_usd`
+
+### 6.3.1 状态机约束
+
+工作流状态机固定为“可暂停、可回流、不可跳依赖阶段”：
+
+- `ingest -> analyze -> bibles -> benchmark -> plan -> compile-prompts -> route -> generate -> judge -> review -> post -> assemble -> report`
+- 允许的自动回流只有：
+  - `judge -> compile-prompts`
+  - `judge -> route`
+  - `judge -> generate`
+  - `judge -> post`
+- 不允许直接从 `judge` 回流到 `bibles`
+- 若需要修改 `StyleBible / CharacterBible / SceneBible`，必须重新进入 `Gate 1`
 
 ### 6.4 断点续跑
 
@@ -1323,9 +1701,486 @@ workflow:
   max_api_retries: 3
   budget_warning_ratio: 0.8
   budget_hard_stop_ratio: 1.0
+
+benchmark:
+  suite_id: benchmark_suite_v1
+  must_test:
+    - seedance_2_0
+    - kling_3_0
+  optional_test:
+    - runway_gen_4
+    - vidu_q3
+    - hailuo_current
+  weights:
+    task_ceiling: 0.25
+    continuity: 0.20
+    motion_stability: 0.15
+    identity_consistency: 0.15
+    instruction_fidelity: 0.10
+    camera_control: 0.10
+    cost_efficiency: 0.05
+  thresholds:
+    minimum_total_score: 7.5
+    minimum_task_ceiling_for_tier1: 8.0
+    close_margin_keep_both_tier1: 0.4
+    clear_win_for_archetype: 0.8
+
+routing:
+  max_queue_wait_min: 20
+  fuse_after_failures: 3
+  fuse_cooldown_min: 30
+  route_matrix:
+    hero_cinematic: [veo_3_1, veo_3_1_fast, runway_gen_4_5]
+    narrative_multi_shot: [seedance_2_0, kling_3_0, runway_gen_4]
+    reference_storytelling: [seedance_2_0, vidu_q3, kling_3_0]
+    motion_control: [kling_3_0, seedance_2_0, runway_gen_4]
+    action_heavy: [kling_3_0, runway_gen_4, seedance_2_0]
+    dialogue_native_audio: [vidu_q3, seedance_2_0, kling_3_0]
+    reference_consistency: [vidu_q3, kling_3_0, seedance_2_0]
+    insert_cutaway: [vidu_q3, hailuo_current, wan]
+``` 
+
+### 9.2 `ReferenceAsset / ReferenceManifest / ReferencePack` 字段契约
+
+#### `ReferenceAsset`
+
+`ReferenceAsset` 表示一条最小参考单元，既可以是视频，也可以是图片，也可以是文本注释的抽取片段。
+
+最小字段集合固定如下：
+
+```yaml
+reference_asset_id: string
+asset_type: video|image|text
+source_path: string
+derived_from: string|null
+language: string|null
+duration_sec: float|null
+frame_range: [int, int]|null
+tags:
+  role: style|character|scene|motion|prop|dialogue|camera
+  confidence: float
+labels: string[]
+quality_flags:
+  blurry: bool
+  watermark: bool
+  low_light: bool
+  duplicate_suspect: bool
+created_at: datetime
 ```
 
-### 9.2 `Prompt Spec` 示例
+#### `ReferenceManifest`
+
+`ReferenceManifest` 是 ingest 阶段的索引文件，用于描述“导入了什么”和“它们被初步归类为什么”。
+
+最小字段集合固定如下：
+
+```yaml
+manifest_id: string
+project_id: string
+imported_assets: string[]
+failed_assets: string[]
+dedup_groups: string[][]
+shot_segments: string[]
+keyframes: string[]
+stats:
+  num_videos: int
+  num_images: int
+  num_text_notes: int
+  num_shot_segments: int
+  num_keyframes: int
+created_at: datetime
+```
+
+#### `ReferencePack`
+
+`ReferencePack` 是进入分析和 bible 构建前的标准化产物。
+
+最小字段集合固定如下：
+
+```yaml
+reference_pack_id: string
+project_id: string
+manifest_id: string
+style_assets: string[]
+character_assets: string[]
+scene_assets: string[]
+motion_assets: string[]
+prop_assets: string[]
+dialogue_assets: string[]
+excluded_assets: string[]
+pack_version: string
+created_at: datetime
+```
+
+约束规则固定如下：
+
+- 每个 `ReferenceAsset` 只能在 `ReferencePack` 中属于一个主 role
+- `excluded_assets` 中的资产不得进入 bible 构建
+- `motion_assets` 默认优先来自视频切段，而不是静态图片
+
+### 9.3 `StyleBible / CharacterBible / SceneBible` 字段契约
+
+#### `StyleBible`
+
+```yaml
+style_bible_id: string
+project_id: string
+era_target: string
+tone_keywords: string[]
+palette_keywords: string[]
+texture_keywords: string[]
+lens_language: string[]
+camera_movement_rules: string[]
+negative_style_rules: string[]
+hero_reference_assets: string[]
+locked: bool
+version: string
+```
+
+#### `CharacterBible`
+
+```yaml
+character_bible_id: string
+project_id: string
+characters:
+  - character_id: string
+    display_name: string
+    role_type: lead|support|extra
+    reference_assets: string[]
+    identity_keywords: string[]
+    wardrobe_ids: string[]
+    prop_ids: string[]
+    continuity_rules: string[]
+    allow_lora: bool
+    allow_face_reference: bool
+locked: bool
+version: string
+```
+
+#### `SceneBible`
+
+```yaml
+scene_bible_id: string
+project_id: string
+locations:
+  - location_id: string
+    display_name: string
+    category: interior|exterior|vehicle|virtual|other
+    reference_assets: string[]
+    geometry_proxy_type: blender_blockout|panorama_box|depth_proxy|none
+    lighting_states: string[]
+    continuity_rules: string[]
+props:
+  - prop_id: string
+    display_name: string
+    reference_assets: string[]
+    continuity_rules: string[]
+locked: bool
+version: string
+```
+
+约束规则固定如下：
+
+- 任一 `CharacterBible` 中的 `character_id` 不得重复
+- 任一 `SceneBible` 中的 `location_id / prop_id` 不得重复
+- `locked=true` 后，若要修改 bible，必须重新走 `Gate 1`
+- `StyleBible.hero_reference_assets` 至少保留 `8-20` 张代表性关键帧或参考图
+
+### 9.4 `ShotSpec` 字段契约
+
+`ShotSpec` 是整条工作流的核心对象，所有后续模块都围绕它展开。  
+实现者不得把 `ShotSpec` 简化成只有一句 prompt 的结构。
+
+最小字段集合固定如下：
+
+```yaml
+shot_id: string
+scene_id: string
+sequence_id: string
+grade: A|B|C
+archetype: hero_cinematic|narrative_multi_shot|reference_storytelling|motion_control|action_heavy|dialogue_native_audio|reference_consistency|insert_cutaway
+story_purpose: string
+duration_target_sec: int
+aspect_ratio: 16:9|9:16|1:1|2.39:1
+subject: string
+location: string
+action: string
+camera: string
+style: string
+needs_native_audio: bool
+needs_reference_consistency: bool
+needs_motion_control: bool
+continuity:
+  character_ids: string[]
+  wardrobe_ids: string[]
+  location_id: string
+  prop_ids: string[]
+references:
+  image_refs: string[]
+  video_refs: string[]
+  text_refs: string[]
+provider_constraints:
+  allowed_providers: string[]
+  banned_providers: string[]
+  preferred_first_tier: bool
+post_requirements:
+  lip_sync: bool
+  interpolation: bool
+  upscale: bool
+  color_match: bool
+budget_class: hero|standard|cheap
+```
+
+约束规则固定如下：
+
+- `grade=A` 的镜头必须同时填写 `story_purpose`、`duration_target_sec`、`continuity`
+- `archetype` 必须是单值主标签，不允许缺失
+- 若 `needs_reference_consistency=true`，则 `references.image_refs` 不得为空
+- 若 `needs_motion_control=true`，则 `archetype` 不得为 `insert_cutaway`
+- `provider_constraints.allowed_providers` 留空时，默认使用 router 全局矩阵
+
+### 9.5 `PromptPacket` 字段契约
+
+`PromptPacket` 是 `Prompt Compiler` 的输出，代表“同一个 ShotSpec 在某个 provider 上的具体执行形态”。
+
+最小字段集合固定如下：
+
+```yaml
+packet_id: string
+shot_id: string
+provider: string
+provider_model: string
+prompt_main: string
+prompt_blocks:
+  subject: string
+  location: string
+  action: string
+  camera: string
+  style: string
+  continuity: string
+  negative_or_avoid: string
+  provider_hints: string
+negative_prompt: string|null
+reference_assets:
+  image_refs: string[]
+  video_refs: string[]
+generation_params:
+  duration_sec: int
+  aspect_ratio: string
+  resolution_tier: standard|hd|pro
+  native_audio: bool
+  camera_control_mode: none|light|strong
+  motion_control_mode: none|pose|video_drive
+retry_context:
+  retry_count: int
+  prior_fail_reasons: string[]
+compiler_version: string
+```
+
+约束规则固定如下：
+
+- 每个 provider 对同一 `shot_id` 至少允许产出一个 `PromptPacket`
+- `provider_model` 必须显式记录，不允许只写 provider 名称
+- `retry_context.prior_fail_reasons` 由回流阶段自动补写
+- 同一 `shot_id + provider + compiler_version` 组合不得重复生成同一 `packet_id`
+
+### 9.6 `GenerationJob` 与 `JudgeScore` 字段契约
+
+#### `GenerationJob`
+
+```yaml
+job_id: string
+shot_id: string
+packet_id: string
+provider: string
+provider_model: string
+provider_rank: 1|2|3
+selected_reason: string
+archetype: string
+grade: A|B|C
+budget_class: hero|standard|cheap
+estimated_cost_usd: float
+queue_policy: normal|priority|economy
+fallback_chain: string[]
+status: queued|running|succeeded|failed|canceled|timed_out
+external_job_id: string|null
+created_at: datetime
+updated_at: datetime
+```
+
+#### `JudgeScore`
+
+```yaml
+judge_score_id: string
+candidate_clip_id: string
+shot_id: string
+provider: string
+grade: A|B|C
+metrics:
+  identity_consistency: float
+  scene_consistency: float
+  instruction_fidelity: float
+  motion_stability: float
+  camera_language: float
+  image_quality: float
+  audio_sync: float|null
+  narrative_utility: float
+  artifact_penalty: float
+weighted_total_score: float
+hard_fail: bool
+hard_fail_reasons: string[]
+decision: pass|review|regenerate_same_provider|reroute_provider|send_to_post_fix|reject
+route_back_stage: compile-prompts|route|generate|post|null
+judge_model: string
+judge_prompt_version: string
+created_at: datetime
+```
+
+### 9.7 `CandidateClip / Artifact / HumanGateDecision / BudgetLedger` 字段契约
+
+#### `CandidateClip`
+
+`CandidateClip` 表示一个已从 provider 拉回、可供评分与入围的候选视频片段。
+
+```yaml
+candidate_clip_id: string
+job_id: string
+shot_id: string
+provider: string
+provider_model: string
+artifact_path: string
+thumbnail_path: string|null
+duration_sec: float
+resolution: string
+has_native_audio: bool
+source_type: text2video|image2video|reference2video|motion_control|extend
+artifact_hash: string
+status: ready|corrupt|missing
+created_at: datetime
+```
+
+#### `Artifact`
+
+`Artifact` 是所有中间产物和最终产物的统一索引对象，不限于视频。
+
+```yaml
+artifact_id: string
+run_id: string
+artifact_type: raw_video|raw_image|shot_segment|keyframe|reference_pack|bible|prompt_packet|candidate_clip|judge_report|post_clip|sequence|report
+artifact_path: string
+source_stage: string
+source_id: string|null
+content_hash: string
+file_size_bytes: int
+retention_policy: keep|cache|delete_after_run
+created_at: datetime
+```
+
+#### `HumanGateDecision`
+
+`HumanGateDecision` 用于记录 Gate 1-4 的人工决策。
+
+```yaml
+gate_decision_id: string
+run_id: string
+gate_name: gate_1|gate_2|gate_3|gate_4
+status: waiting|approved|rejected|expired
+reviewer: string
+decision_summary: string
+approved_ids: string[]
+rejected_ids: string[]
+notes: string
+created_at: datetime
+updated_at: datetime
+```
+
+#### `BudgetLedger`
+
+`BudgetLedger` 是预算与成本的唯一事实来源。
+
+```yaml
+ledger_id: string
+run_id: string
+provider: string
+job_id: string|null
+event_type: reserve|commit|refund|adjust
+budget_class: hero|standard|cheap
+estimated_cost_usd: float
+actual_cost_usd: float|null
+currency: USD
+notes: string
+created_at: datetime
+```
+
+约束规则固定如下：
+
+- `CandidateClip.artifact_hash` 相同的片段不得重复写入不同 `candidate_clip_id`
+- `Artifact.retention_policy=keep` 的产物不得被自动清理
+- `HumanGateDecision.status=approved` 后，必须至少有一个 `approved_ids`
+- `BudgetLedger.event_type=commit` 的记录必须与某个 `job_id` 或批次来源绑定
+
+### 9.8 目录产物命名规范与生命周期规则
+
+#### 命名规范
+
+目录与文件命名必须满足“可回溯、可 grep、可排序”三条原则。  
+默认命名模板固定如下：
+
+- 原始视频：
+  - `workspace/raw_videos/{reference_asset_id}__{source_stem}.mp4`
+- 原始图片：
+  - `workspace/raw_images/{reference_asset_id}__{source_stem}.png`
+- 切镜片段：
+  - `workspace/shots/{scene_id}/{shot_id}__segment_{index}.mp4`
+- 关键帧：
+  - `workspace/keyframes/{shot_id}__kf_{frame_no}.png`
+- prompt packet：
+  - `workspace/prompts/{shot_id}__{provider}__v{compiler_version}.json`
+- 生成候选：
+  - `workspace/candidates/{shot_id}/{provider}__rank{provider_rank}__job_{job_id}.mp4`
+- 评分结果：
+  - `workspace/review/{shot_id}__judge_{judge_score_id}.json`
+- 后期结果：
+  - `workspace/post/{shot_id}__post_{strategy_id}.mp4`
+- 序列装配结果：
+  - `workspace/reports/{run_id}__assembly_manifest.json`
+  - `workspace/reports/{run_id}__budget_report.json`
+
+禁止行为：
+
+- 禁止使用空格作文件名分隔符
+- 禁止只用自然语言句子当作产物文件名
+- 禁止不带 `shot_id / provider / job_id` 的候选视频命名
+
+#### 生命周期规则
+
+各类产物的默认保留策略固定如下：
+
+- `raw_videos / raw_images / reference_pack / bibles / judge_reports / final sequence / reports`
+  - `retention_policy = keep`
+- `shot_segments / keyframes / prompt packets / candidate clips / post clips`
+  - `retention_policy = cache`
+- 临时下载包、解压中间文件、失败的空文件、过期截图
+  - `retention_policy = delete_after_run`
+
+自动清理规则固定如下：
+
+- `delete_after_run` 仅在 `run.status in [completed, failed, canceled]` 后允许清理
+- `cache` 类产物默认保留最近 `N=3` 次运行版本
+- 若磁盘空间告警，则优先清理 `delete_after_run`，再清理最旧的 `cache`
+- `keep` 类产物必须显式人工确认才可删除
+
+回放与复现实验规则固定如下：
+
+- 任何进入 `Gate 3` 的候选必须能通过 `candidate_clip_id` 反查到：
+  - `job_id`
+  - `packet_id`
+  - `shot_id`
+  - `provider_model`
+  - `judge_score_id`
+- 任何进入 `Gate 4` 的序列镜头必须能反查其全部祖先产物链
+
+### 9.9 `Prompt Spec` 示例
 
 ```yaml
 shot_id: S012
@@ -1346,7 +2201,7 @@ avoid:
   - 过强景深虚化
 ```
 
-### 9.3 Provider Adapter 统一接口
+### 9.10 Provider Adapter 统一接口
 
 ```python
 class ProviderAdapter:
@@ -1368,7 +2223,7 @@ class ProviderAdapter:
         ...
 ```
 
-### 9.4 工作目录建议
+### 9.11 工作目录建议
 
 ```text
 docs/
@@ -1397,7 +2252,256 @@ config/
   project.yaml
 ```
 
----
+### 9.12 错误码与失败原因 Taxonomy
+
+系统必须统一使用结构化错误码，禁止仅返回自由文本错误消息。  
+错误码格式固定为：
+
+```text
+MG_<DOMAIN>_<CODE>
+```
+
+其中 `DOMAIN` 只允许取以下值：
+
+- `INGEST`
+- `ANALYZE`
+- `BIBLE`
+- `BENCHMARK`
+- `PROMPT`
+- `ROUTE`
+- `PROVIDER`
+- `JUDGE`
+- `POST`
+- `ASSEMBLY`
+- `SYSTEM`
+
+推荐的基础错误码集合固定如下：
+
+| 错误码 | 含义 | 默认动作 |
+|---|---|---|
+| `MG_INGEST_001` | 输入文件不存在 | 记录失败并跳过单文件 |
+| `MG_INGEST_002` | 文件格式不支持 | 记录失败并跳过单文件 |
+| `MG_INGEST_003` | 媒体解码失败 | 标记坏文件 |
+| `MG_ANALYZE_001` | 参考分析失败 | 回退到粗粒度分析 |
+| `MG_BIBLE_001` | Bible 构建不完整 | 阻断后续并等待 Gate 1 |
+| `MG_BENCHMARK_001` | 候选 provider 大面积失败 | 重新 benchmark |
+| `MG_PROMPT_001` | Prompt 编译失败 | 回流编译器 |
+| `MG_ROUTE_001` | 无可用 provider | 暂停并请求人工确认 |
+| `MG_PROVIDER_001` | API 提交失败 | 自动重试 |
+| `MG_PROVIDER_002` | API 轮询超时 | 切换 fallback |
+| `MG_PROVIDER_003` | 产物下载失败 | 单独重试下载 |
+| `MG_JUDGE_001` | 评分失败 | 允许重评，不重生成 |
+| `MG_JUDGE_002` | 候选硬失败 | 直接回流 |
+| `MG_POST_001` | 后期处理失败 | 保留 pre-post 回退 |
+| `MG_ASSEMBLY_001` | 序列装配失败 | 不影响已产生产物 |
+| `MG_SYSTEM_001` | SQLite 状态冲突 | 终止当前 run |
+| `MG_SYSTEM_002` | 磁盘空间不足 | 触发清理策略并暂停 |
+| `MG_SYSTEM_003` | 预算硬停 | 阻止新生成任务 |
+
+失败原因分类固定为以下枚举，不允许自由扩散：
+
+- `missing_input`
+- `unsupported_format`
+- `decode_failure`
+- `reference_mismatch`
+- `identity_drift`
+- `scene_drift`
+- `motion_collapse`
+- `camera_mismatch`
+- `native_audio_mismatch`
+- `provider_timeout`
+- `provider_queue_overload`
+- `provider_output_corrupt`
+- `artifact_missing`
+- `budget_exceeded`
+- `state_conflict`
+- `manual_gate_rejected`
+
+错误处理优先级固定如下：
+
+- `fatal`
+  - 终止当前 run 或阻断关键 stage
+  - 例：`state_conflict`、`budget_exceeded`
+- `recoverable`
+  - 自动重试或回流
+  - 例：`provider_timeout`、`camera_mismatch`
+- `skippable`
+  - 记录后跳过单文件或单候选
+  - 例：`unsupported_format`、`artifact_missing`
+
+### 9.13 日志、审计与可观测性字段
+
+系统必须同时输出三类日志：
+
+- `run log`
+  - 面向整次执行
+- `stage log`
+  - 面向单个阶段
+- `job log`
+  - 面向单个 provider 任务
+
+所有日志记录必须包含以下基础字段：
+
+```yaml
+timestamp: datetime
+run_id: string
+stage_name: string|null
+shot_id: string|null
+job_id: string|null
+provider: string|null
+level: DEBUG|INFO|WARN|ERROR
+event_type: string
+message: string
+error_code: string|null
+metadata: object
+```
+
+必须额外记录的可观测性指标固定如下：
+
+- `queue_wait_sec`
+- `generation_duration_sec`
+- `download_duration_sec`
+- `judge_duration_sec`
+- `post_duration_sec`
+- `estimated_cost_usd`
+- `actual_cost_usd`
+- `retry_count`
+- `fallback_depth`
+- `artifact_size_bytes`
+
+审计日志的最低要求固定如下：
+
+- 每次 `Gate 1-4` 决策必须留下审计记录
+- 每次 provider 路由选择必须留下 `route_reason`
+- 每次成本从 `reserve -> commit` 的变化必须留痕
+- 每次删除 `cache` 或 `delete_after_run` 产物必须留痕
+
+建议的日志落盘路径固定如下：
+
+```text
+workspace/logs/
+  runs/{run_id}.jsonl
+  stages/{run_id}__{stage_name}.jsonl
+  jobs/{job_id}.jsonl
+```
+
+指标聚合报表最低要求固定如下：
+
+- 每个 provider 的平均通过率
+- 每个 archetype 的平均总分
+- 每个 stage 的平均耗时
+- 每美元可获得的有效候选数
+- 第一梯队 provider 与第二梯队 provider 的命中率对比
+
+### 9.14 CLI 命令参数与返回码约定
+
+CLI 必须统一采用 `Typer` 风格子命令，不允许混用多套风格。  
+最小命令集合固定如下：
+
+```text
+moviegen run
+moviegen resume
+moviegen status
+moviegen benchmark
+moviegen gate
+moviegen report
+moviegen clean
+```
+
+核心命令规范如下：
+
+#### `moviegen run`
+
+```bash
+moviegen run project.yaml --stage all --run-id <optional> --force-stage <optional> --dry-run
+```
+
+参数约定：
+
+- `project.yaml`
+  - 必填
+- `--stage`
+  - 默认 `all`
+  - 允许值：`ingest|analyze|bibles|benchmark|plan|compile-prompts|route|generate|judge|review|post|assemble|report|all`
+- `--run-id`
+  - 可选；用于恢复或指定一次运行
+- `--force-stage`
+  - 可选；允许重跑某个已成功阶段
+- `--dry-run`
+  - 只验证配置与路由，不提交 provider 任务
+
+#### `moviegen resume`
+
+```bash
+moviegen resume --run-id <run_id>
+```
+
+参数约定：
+
+- `--run-id`
+  - 必填；恢复一个已暂停或失败但可恢复的执行
+
+#### `moviegen gate`
+
+```bash
+moviegen gate --run-id <run_id> --gate gate_2 --approve ids.json
+moviegen gate --run-id <run_id> --gate gate_3 --reject ids.json
+```
+
+参数约定：
+
+- `--run-id`
+  - 必填
+- `--gate`
+  - 必填；`gate_1|gate_2|gate_3|gate_4`
+- `--approve`
+  - 可选；批准的对象清单
+- `--reject`
+  - 可选；拒绝的对象清单
+
+#### `moviegen clean`
+
+```bash
+moviegen clean --run-id <run_id> --scope cache
+```
+
+参数约定：
+
+- `--scope`
+  - `cache|tmp|all_safe`
+- 不允许通过 CLI 直接清理 `keep` 类产物
+
+返回码约定固定如下：
+
+- `0`
+  - 成功完成
+- `10`
+  - 参数错误
+- `20`
+  - 配置校验失败
+- `30`
+  - 缺少输入或路径错误
+- `40`
+  - Gate 等待中，命令正常退出但流程暂停
+- `50`
+  - provider 层失败
+- `60`
+  - judge 或 review 阶段失败
+- `70`
+  - 预算硬停
+- `80`
+  - 状态机冲突或数据库错误
+- `90`
+  - 未知系统错误
+
+CLI 输出约定固定如下：
+
+- 面向人类的终端输出保持简短
+- 面向机器的结构化结果统一落在：
+  - `stdout` 的一行 JSON 摘要
+  - `workspace/reports/` 下的完整结果文件
+
+--- 
 
 ## 10. 最终执行结论
 
