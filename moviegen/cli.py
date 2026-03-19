@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -338,6 +339,10 @@ def doctor() -> None:
     payload = {
         "execution_default_primary": "kling_3_0",
         "execution_default_optional": "vidu_q3",
+        "local_tools": {
+            "ffmpeg": bool(shutil.which("ffmpeg")),
+            "ffprobe": bool(shutil.which("ffprobe")),
+        },
         "env": {
             "MOVIEGEN_KLING_SUBMIT_URL": bool(os.getenv("MOVIEGEN_KLING_SUBMIT_URL")),
             "MOVIEGEN_KLING_POLL_URL_TEMPLATE": bool(os.getenv("MOVIEGEN_KLING_POLL_URL_TEMPLATE")),

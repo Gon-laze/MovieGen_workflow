@@ -502,6 +502,50 @@ def compute_next_release_version(root: Path, project_id: str) -> str:
     return f"v{max_version + 1:03d}"
 
 
+def build_ffmpeg_post_command(spec: ProjectSpec, source_media_path: Path, processed_path: Path) -> list[str]:
+    template = spec.post.processing_template
+    ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+    if template == "stream_copy_fast":
+        return [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(source_media_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(processed_path),
+        ]
+    return [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        str(source_media_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        spec.post.ffmpeg_preset,
+        "-crf",
+        str(spec.post.ffmpeg_crf),
+        "-c:a",
+        "aac",
+        "-b:a",
+        spec.post.audio_bitrate,
+        "-movflags",
+        "+faststart",
+        str(processed_path),
+    ]
+
+
 def build_live_submission_attempts(spec: ProjectSpec, shot_jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not shot_jobs:
         return []
@@ -1829,7 +1873,8 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             source_review_gate = review_payload.get("gate")
 
     ffmpeg_path = shutil.which("ffmpeg")
-    processing_mode = "ffmpeg_stream_copy" if ffmpeg_path else "file_copy_fallback"
+    requested_template = spec.post.processing_template
+    processing_mode = requested_template if ffmpeg_path else f"file_copy_fallback:{requested_template}"
     processed_dir = ctx.root / "workspace" / "post" / "processed" / ctx.run_id
     processed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1854,27 +1899,23 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         processed_path = processed_dir / processed_filename
         operation = {
             "mode": processing_mode,
+            "requested_template": requested_template,
             "source_media_artifact_path": str(source_media_path),
             "processed_media_path": str(processed_path),
             "ffmpeg_path": ffmpeg_path,
         }
         try:
             if ffmpeg_path:
-                cmd = [
-                    ffmpeg_path,
-                    "-y",
-                    "-i",
-                    str(source_media_path),
-                    "-c",
-                    "copy",
-                    str(processed_path),
-                ]
+                cmd = build_ffmpeg_post_command(spec, source_media_path, processed_path)
+                operation["ffmpeg_command"] = cmd
                 result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
                 operation["returncode"] = result.returncode
                 if result.returncode != 0:
                     operation["stderr"] = result.stderr.strip()[:1000]
-                    raise RuntimeError("ffmpeg_stream_copy_failed")
+                    raise RuntimeError("ffmpeg_post_processing_failed")
             else:
+                if not spec.post.fallback_copy_enabled:
+                    raise RuntimeError("fallback_copy_disabled")
                 shutil.copy2(source_media_path, processed_path)
 
             processed_probe = probe_media_file(processed_path)
@@ -1891,6 +1932,7 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                 "weighted_total_score": item.get("weighted_total_score"),
                 "post_processing_mode": processing_mode,
                 "post_processing_status": "processed",
+                "post_processing_template": requested_template,
                 "post_processing_details": operation,
                 "processed_media_probe": processed_probe,
                 "processed_media_gate": processed_gate,
@@ -1903,6 +1945,7 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                     "provider": item.get("provider"),
                     "status": "processed",
                     "processing_mode": processing_mode,
+                    "processing_template": requested_template,
                     "processed_media_path": str(processed_path),
                 }
             )
@@ -1942,6 +1985,7 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                     "processed_media_path": str(processed_path),
                     "error": str(exc),
                     "processing_mode": processing_mode,
+                    "processing_template": requested_template,
                 }
             )
 
@@ -1973,6 +2017,7 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         "blocked_candidates": blocked_candidates,
         "source_review_gate": source_review_gate,
         "processing_mode": processing_mode,
+        "processing_template": requested_template,
         "counts": {
             "post_candidates": len(post_candidates),
             "blocked_candidates": len(blocked_candidates),

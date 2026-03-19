@@ -1567,3 +1567,64 @@
 
 - 如果继续推进，最自然的是补 `ffmpeg` 可用时的真实 remux/transcode 参数模板
 - 或者给 release 再补一个单独的 zip 校验文件
+
+## 2026-03-20 Round 31
+
+### 改动
+
+- 为 `post` 增加模板化处理策略
+  - 新增 `post.processing_template`
+    - `stream_copy_fast`
+    - `normalize_h264_faststart`
+  - 新增参数：
+    - `ffmpeg_preset`
+    - `ffmpeg_crf`
+    - `audio_bitrate`
+    - `fallback_copy_enabled`
+- `doctor` 现在会直接显示：
+  - `local_tools.ffmpeg`
+  - `local_tools.ffprobe`
+- `post` 现在会明确区分：
+  - 请求的模板 `post_processing_template`
+  - 实际执行模式 `post_processing_mode`
+- 在无 `ffmpeg` 环境下，会稳定记录：
+  - `file_copy_fallback:normalize_h264_faststart`
+  - 而不是模糊地只写 copy fallback
+- `post_summary` / `post_jobs` / `post_candidates` 已同步带上模板信息
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 运行 `python -m moviegen.cli doctor`
+  - 确认当前环境 `ffmpeg=false`, `ffprobe=false`
+- 再跑一轮 post -> report：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260320_000237_9735e324`
+- 检查：
+  - `workspace/post/run_20260320_000237_9735e324__post_summary.json`
+  - `workspace/reports/run_20260320_000237_9735e324__delivery_report.json`
+  - `status --run-id run_20260320_000237_9735e324`
+
+### 效果
+
+- `post` 现在已经不只是“会处理”，而是会明确记录“本来想怎么处理”和“最终怎么处理”
+- 当前环境下验证结果清晰：
+  - `processing_template = normalize_h264_faststart`
+  - `processing_mode = file_copy_fallback:normalize_h264_faststart`
+- `post` 产物链保持有效：
+  - processed media
+  - processed probe
+  - processed gate
+  - post summary
+- 后续 `assemble/release` 继续消费 post 处理后的媒体，并且 release version 已继续递增到：
+  - `moviegen_scifi_001__v003__run_20260320_000237_9735e324`
+
+### 问题
+
+- 当前机器缺少 `ffmpeg/ffprobe`，所以还没走到真正的 remux/transcode 路径
+- 参数模板已经到位，但还缺少对不同模板的真实 ffmpeg 执行验证
+
+### 下一步
+
+- 如果继续推进，最自然的是补一组真正的 ffmpeg 参数模板验证
+- 或者给 release 再补 zip 的单独校验文件

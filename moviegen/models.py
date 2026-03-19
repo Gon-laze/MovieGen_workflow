@@ -114,6 +114,14 @@ class PlanningSection(BaseModel):
     approved_candidates_file: str | None = None
 
 
+class PostSection(BaseModel):
+    processing_template: Literal["stream_copy_fast", "normalize_h264_faststart"] = "normalize_h264_faststart"
+    ffmpeg_preset: str = "medium"
+    ffmpeg_crf: int = Field(default=18, ge=0, le=51)
+    audio_bitrate: str = "192k"
+    fallback_copy_enabled: bool = True
+
+
 class ExecutionSection(BaseModel):
     primary_provider: str = "kling_3_0"
     optional_provider: str = "vidu_q3"
@@ -136,6 +144,7 @@ class ProjectSpec(BaseModel):
     benchmark: BenchmarkSection
     routing: RoutingSection
     planning: PlanningSection = Field(default_factory=PlanningSection)
+    post: PostSection = Field(default_factory=PostSection)
     execution: ExecutionSection = Field(default_factory=ExecutionSection)
 
 

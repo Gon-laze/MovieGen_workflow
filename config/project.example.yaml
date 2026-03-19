@@ -109,6 +109,13 @@ routing:
 planning:
   shot_specs_file: input/shot_specs.example.yaml
 
+post:
+  processing_template: normalize_h264_faststart
+  ffmpeg_preset: medium
+  ffmpeg_crf: 18
+  audio_bitrate: 192k
+  fallback_copy_enabled: true
+
 execution:
   primary_provider: kling_3_0
   optional_provider: vidu_q3
