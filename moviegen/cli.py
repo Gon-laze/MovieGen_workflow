@@ -126,6 +126,12 @@ def load_shot_specs_file(path: Path) -> list[dict[str, object]]:
     return []
 
 
+def load_structured_file(path: Path) -> object:
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def write_run_artifacts(root: Path, run_id: str, summary: dict[str, object]) -> tuple[Path, Path]:
     reports_dir = root / "workspace" / "reports"
     summary_path = reports_dir / f"{run_id}__run_summary.json"
@@ -388,6 +394,9 @@ def resume(
 
     rerun_candidate_ids = {item["candidate_clip_id"] for item in review_payload.get("regenerate_candidates", [])}
     rerun_candidate_ids.update(gate_payload.get("rejected_ids", []))
+    approved_candidate_ids = set(gate_payload.get("approved_ids", []))
+    if not approved_candidate_ids:
+        approved_candidate_ids = {item["candidate_clip_id"] for item in review_payload.get("approved_candidates", [])}
     rerun_shot_ids = sorted(
         {
             str(candidate_map[candidate_id]["shot_id"])
@@ -395,6 +404,7 @@ def resume(
             if candidate_id in candidate_map
         }
     )
+    approved_candidates = [candidate_map[candidate_id] for candidate_id in approved_candidate_ids if candidate_id in candidate_map]
 
     resume_plan = {
         "source_run_id": run_id,
@@ -402,6 +412,7 @@ def resume(
         "review_gate": review_gate,
         "rerun_candidate_ids": sorted(rerun_candidate_ids),
         "rerun_shot_ids": rerun_shot_ids,
+        "approved_candidate_ids": sorted(approved_candidate_ids),
         "created_at": now_iso(),
     }
     resume_plan_path = root / "workspace" / "review" / f"{run_id}__resume_plan.json"
@@ -420,13 +431,149 @@ def resume(
         created_at=now_iso(),
     )
 
-    if not rerun_shot_ids:
+    source_project_file = Path(str(row["project_file"]))
+    if not source_project_file.is_absolute():
+        source_project_file = root / source_project_file
+    project_payload = yaml.safe_load(source_project_file.read_text(encoding="utf-8")) or {}
+    planning = project_payload.setdefault("planning", {})
+    followup_payloads: dict[str, object] = {}
+
+    if rerun_shot_ids:
+        shot_specs_file = planning.get("shot_specs_file")
+        if not shot_specs_file:
+            raise typer.Exit(code=31)
+        shot_specs_path = Path(str(shot_specs_file))
+        if not shot_specs_path.is_absolute():
+            shot_specs_path = root / shot_specs_path
+        shot_specs = load_shot_specs_file(shot_specs_path)
+        filtered_shots = [shot for shot in shot_specs if str(shot.get("shot_id")) in rerun_shot_ids]
+        if not filtered_shots:
+            typer.echo(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "status": row["status"],
+                        "message": "rerun shot ids were resolved, but no matching shot specs were found",
+                        "rerun_shot_ids": rerun_shot_ids,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return
+
+        rerun_followup_run_id = make_run_id()
+        resume_shots_path = root / "workspace" / "review" / f"{rerun_followup_run_id}__resume_shot_specs.yaml"
+        resume_project_path = root / "workspace" / "review" / f"{rerun_followup_run_id}__resume_project.yaml"
+        resume_shots_path.write_text(
+            yaml.safe_dump({"shot_specs": filtered_shots}, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        rerun_project_payload = yaml.safe_load(source_project_file.read_text(encoding="utf-8")) or {}
+        rerun_planning = rerun_project_payload.setdefault("planning", {})
+        rerun_planning["shot_specs_file"] = str(resume_shots_path.relative_to(root)).replace("\\", "/")
+        rerun_project_path_text = yaml.safe_dump(rerun_project_payload, allow_unicode=True, sort_keys=False)
+        resume_project_path.write_text(rerun_project_path_text, encoding="utf-8")
+        insert_artifact(
+            conn,
+            artifact_id=f"artifact_{uuid4().hex[:12]}",
+            run_id=run_id,
+            artifact_type="resume_shot_specs",
+            artifact_path=str(resume_shots_path),
+            source_stage="review",
+            source_id=rerun_followup_run_id,
+            content_hash=sha256_file(resume_shots_path),
+            file_size_bytes=resume_shots_path.stat().st_size,
+            retention_policy="keep",
+            created_at=now_iso(),
+        )
+        insert_artifact(
+            conn,
+            artifact_id=f"artifact_{uuid4().hex[:12]}",
+            run_id=run_id,
+            artifact_type="resume_project_file",
+            artifact_path=str(resume_project_path),
+            source_stage="review",
+            source_id=rerun_followup_run_id,
+            content_hash=sha256_file(resume_project_path),
+            file_size_bytes=resume_project_path.stat().st_size,
+            retention_policy="keep",
+            created_at=now_iso(),
+        )
+        followup_payloads["rerun_followup_run"] = execute_run(
+            root=root,
+            project_file=resume_project_path,
+            stage=Stage.ALL,
+            run_id=rerun_followup_run_id,
+            force_stage=Stage.PLAN.value,
+            dry_run=dry_run,
+        )
+
+    if approved_candidates:
+        post_followup_run_id = make_run_id()
+        approved_candidates_path = root / "workspace" / "review" / f"{post_followup_run_id}__approved_candidates.yaml"
+        approved_project_path = root / "workspace" / "review" / f"{post_followup_run_id}__post_project.yaml"
+        approved_candidates_path.write_text(
+            yaml.safe_dump(
+                {
+                    "source_run_id": run_id,
+                    "source_review_gate": review_gate,
+                    "approved_candidates": approved_candidates,
+                },
+                allow_unicode=True,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        post_project_payload = yaml.safe_load(source_project_file.read_text(encoding="utf-8")) or {}
+        post_planning = post_project_payload.setdefault("planning", {})
+        post_planning["approved_candidates_file"] = str(approved_candidates_path.relative_to(root)).replace("\\", "/")
+        approved_project_path.write_text(
+            yaml.safe_dump(post_project_payload, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        insert_artifact(
+            conn,
+            artifact_id=f"artifact_{uuid4().hex[:12]}",
+            run_id=run_id,
+            artifact_type="approved_candidates_file",
+            artifact_path=str(approved_candidates_path),
+            source_stage="review",
+            source_id=post_followup_run_id,
+            content_hash=sha256_file(approved_candidates_path),
+            file_size_bytes=approved_candidates_path.stat().st_size,
+            retention_policy="keep",
+            created_at=now_iso(),
+        )
+        insert_artifact(
+            conn,
+            artifact_id=f"artifact_{uuid4().hex[:12]}",
+            run_id=run_id,
+            artifact_type="post_project_file",
+            artifact_path=str(approved_project_path),
+            source_stage="review",
+            source_id=post_followup_run_id,
+            content_hash=sha256_file(approved_project_path),
+            file_size_bytes=approved_project_path.stat().st_size,
+            retention_policy="keep",
+            created_at=now_iso(),
+        )
+        followup_payloads["post_followup_run"] = execute_run(
+            root=root,
+            project_file=approved_project_path,
+            stage=Stage.ALL,
+            run_id=post_followup_run_id,
+            force_stage=Stage.POST.value,
+            dry_run=dry_run,
+        )
+
+    if not followup_payloads:
         typer.echo(
             json.dumps(
                 {
                     "run_id": run_id,
                     "status": row["status"],
-                    "message": "no rerun candidates were selected; resume completed without launching a follow-up run",
+                    "message": "no rerun or approved candidates were selected; resume completed without launching a follow-up run",
                     "resume_plan_path": str(resume_plan_path),
                 },
                 ensure_ascii=False,
@@ -435,89 +582,14 @@ def resume(
         )
         return
 
-    source_project_file = Path(str(row["project_file"]))
-    if not source_project_file.is_absolute():
-        source_project_file = root / source_project_file
-    project_payload = yaml.safe_load(source_project_file.read_text(encoding="utf-8")) or {}
-    planning = project_payload.setdefault("planning", {})
-    shot_specs_file = planning.get("shot_specs_file")
-    if not shot_specs_file:
-        raise typer.Exit(code=31)
-
-    shot_specs_path = Path(str(shot_specs_file))
-    if not shot_specs_path.is_absolute():
-        shot_specs_path = root / shot_specs_path
-    shot_specs = load_shot_specs_file(shot_specs_path)
-    filtered_shots = [shot for shot in shot_specs if str(shot.get("shot_id")) in rerun_shot_ids]
-    if not filtered_shots:
-        typer.echo(
-            json.dumps(
-                {
-                    "run_id": run_id,
-                    "status": row["status"],
-                    "message": "rerun shot ids were resolved, but no matching shot specs were found",
-                    "rerun_shot_ids": rerun_shot_ids,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return
-
-    followup_run_id = make_run_id()
-    resume_shots_path = root / "workspace" / "review" / f"{followup_run_id}__resume_shot_specs.yaml"
-    resume_project_path = root / "workspace" / "review" / f"{followup_run_id}__resume_project.yaml"
-    resume_shots_path.write_text(
-        yaml.safe_dump({"shot_specs": filtered_shots}, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
-    planning["shot_specs_file"] = str(resume_shots_path.relative_to(root)).replace("\\", "/")
-    resume_project_path.write_text(
-        yaml.safe_dump(project_payload, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
-    insert_artifact(
-        conn,
-        artifact_id=f"artifact_{uuid4().hex[:12]}",
-        run_id=run_id,
-        artifact_type="resume_shot_specs",
-        artifact_path=str(resume_shots_path),
-        source_stage="review",
-        source_id=followup_run_id,
-        content_hash=sha256_file(resume_shots_path),
-        file_size_bytes=resume_shots_path.stat().st_size,
-        retention_policy="keep",
-        created_at=now_iso(),
-    )
-    insert_artifact(
-        conn,
-        artifact_id=f"artifact_{uuid4().hex[:12]}",
-        run_id=run_id,
-        artifact_type="resume_project_file",
-        artifact_path=str(resume_project_path),
-        source_stage="review",
-        source_id=followup_run_id,
-        content_hash=sha256_file(resume_project_path),
-        file_size_bytes=resume_project_path.stat().st_size,
-        retention_policy="keep",
-        created_at=now_iso(),
-    )
-
-    followup_payload = execute_run(
-        root=root,
-        project_file=resume_project_path,
-        stage=Stage.ALL,
-        run_id=followup_run_id,
-        force_stage=Stage.PLAN.value,
-        dry_run=dry_run,
-    )
     typer.echo(
         json.dumps(
             {
                 "source_run_id": run_id,
                 "resume_plan_path": str(resume_plan_path),
-                "followup_run": followup_payload,
+                **followup_payloads,
                 "rerun_shot_ids": rerun_shot_ids,
+                "approved_candidate_ids": sorted(approved_candidate_ids),
             },
             ensure_ascii=False,
             indent=2,

@@ -111,6 +111,7 @@ class RoutingSection(BaseModel):
 
 class PlanningSection(BaseModel):
     shot_specs_file: str | None = None
+    approved_candidates_file: str | None = None
 
 
 class ExecutionSection(BaseModel):

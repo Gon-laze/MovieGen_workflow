@@ -1140,3 +1140,63 @@
 
 - 让 `resume` 对 `approved_candidates` 和 `approved gate` 也能继续向后推进
 - 或者把 `post` 从 placeholder 提升为真正的后处理/交付前阶段
+
+## 2026-03-19 Round 24
+
+### 改动
+
+- 把 `post` 从 placeholder 提升为真实阶段
+  - 支持两种输入来源：
+    - 当前 run 的 `review_summary`
+    - `planning.approved_candidates_file`
+  - 输出真实 `post_summary`
+  - 区分：
+    - `post_candidates`
+    - `blocked_candidates`
+- 扩展 `resume`
+  - 现在会同时处理两类 follow-up：
+    - `rerun_followup_run`：给 rejected / regenerate 的 shot 继续从 `plan` 开始跑
+    - `post_followup_run`：给 approved candidates 直接从 `post` 开始跑
+- 为 `resume` 生成新的 post 输入文件
+  - `approved_candidates.yaml`
+  - 其中包含：
+    - `source_run_id`
+    - `source_review_gate`
+    - `approved_candidates`
+- `stage_post` 现在会把 `source_review_gate` 带进 `post_summary`
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 使用已审批的 source run 继续验证：
+  - source run: `run_20260319_223709_0f28a433`
+- 运行：
+  - `python -m moviegen.cli resume --run-id run_20260319_223709_0f28a433 --dry-run`
+- 结果得到两条 follow-up：
+  - `rerun_followup_run = run_20260319_230219_3df22c20`
+  - `post_followup_run = run_20260319_230220_6f88ecdd`
+- 检查：
+  - `workspace/post/run_20260319_230220_6f88ecdd__post_summary.json`
+  - `workspace/review/run_20260319_230220_6f88ecdd__approved_candidates.yaml`
+  - `status --run-id` 两条 follow-up run
+
+### 效果
+
+- `resume` 不再只会“重跑被拒镜头”，现在也会“推进已批准候选到 post”
+- 在本轮验证中：
+  - `rerun_followup_run` 只续跑了 `SHOT_001`
+  - `post_followup_run` 成功把 2 个 approved candidates 直接送进 `post`
+- `post_summary` 已真实包含：
+  - 2 个 `post_candidates`
+  - 来源 `source_review_gate`
+  - 每个 approved candidate 的媒体路径、provider、media_gate_status、score
+
+### 问题
+
+- `post` 现在还是“后处理前的排队与汇总”阶段，还没有执行真实超分、补帧、口型、调色等处理
+- `source_review_gate` 是否保留原 `decision_summary`，取决于历史 gate 数据本身；旧 gate 若已被清空摘要，当前只能如实透传 null
+
+### 下一步
+
+- 把 `post` 提升为真正的后处理入口
+- 或者把 `approved_candidates` 继续送入 `assemble`，形成最小交付链路

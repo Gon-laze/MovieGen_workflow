@@ -1790,6 +1790,92 @@ def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     )
 
 
+def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
+    approved_candidates_file = spec.planning.approved_candidates_file
+    approved_candidates: list[dict[str, Any]] = []
+    pending_review_candidates: list[dict[str, Any]] = []
+    regenerate_candidates: list[dict[str, Any]] = []
+    source_review_gate: dict[str, Any] | None = None
+
+    if approved_candidates_file:
+        source_path = Path(approved_candidates_file)
+        if not source_path.is_absolute():
+            source_path = ctx.root / source_path
+        if source_path.exists():
+            payload = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
+            approved_candidates = payload.get("approved_candidates", []) or []
+            source_review_gate = payload.get("source_review_gate")
+    else:
+        review_path = ctx.root / "workspace" / "review" / f"{ctx.run_id}__review_summary.json"
+        if review_path.exists():
+            review_payload = json.loads(review_path.read_text(encoding="utf-8"))
+            pending_review_candidates = review_payload.get("review_candidates", []) or []
+            regenerate_candidates = review_payload.get("regenerate_candidates", []) or []
+            approved_candidates = review_payload.get("approved_candidates", []) or []
+            source_review_gate = review_payload.get("gate")
+
+    post_candidates = [
+        {
+            "candidate_clip_id": item["candidate_clip_id"],
+            "shot_id": item["shot_id"],
+            "provider": item.get("provider"),
+            "planned_provider": item.get("planned_provider"),
+            "source_type": item.get("source_type"),
+            "media_artifact_path": item.get("media_artifact_path"),
+            "media_gate_status": item.get("media_gate_status"),
+            "weighted_total_score": item.get("weighted_total_score"),
+        }
+        for item in approved_candidates
+    ]
+    blocked_candidates = [
+        {
+            "candidate_clip_id": item["candidate_clip_id"],
+            "shot_id": item["shot_id"],
+            "provider": item.get("provider"),
+            "reason": "pending_review",
+        }
+        for item in pending_review_candidates
+    ]
+    blocked_candidates.extend(
+        {
+            "candidate_clip_id": item["candidate_clip_id"],
+            "shot_id": item["shot_id"],
+            "provider": item.get("provider"),
+            "reason": "needs_regenerate",
+        }
+        for item in regenerate_candidates
+    )
+
+    payload = {
+        "post_id": f"post_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "post_candidates": post_candidates,
+        "blocked_candidates": blocked_candidates,
+        "source_review_gate": source_review_gate,
+        "counts": {
+            "post_candidates": len(post_candidates),
+            "blocked_candidates": len(blocked_candidates),
+        },
+        "note": (
+            f"Prepared post queue for {len(post_candidates)} approved candidates."
+            if post_candidates
+            else "Post stage found no approved candidates to continue."
+        ),
+        "created_at": now_iso(),
+    }
+    out = ctx.root / "workspace" / "post" / f"{ctx.run_id}__post_summary.json"
+    write_json(out, payload)
+    ctx.record_artifact(path=out, artifact_type="post_report", source_stage=Stage.POST.value)
+    return StageResult(
+        note=payload["note"],
+        artifacts=[out],
+        metadata={
+            "post_candidate_count": len(post_candidates),
+            "blocked_candidate_count": len(blocked_candidates),
+        },
+    )
+
+
 STAGE_HANDLERS = {
     Stage.INGEST: stage_ingest,
     Stage.ANALYZE: stage_analyze,
@@ -1801,6 +1887,7 @@ STAGE_HANDLERS = {
     Stage.GENERATE: stage_generate,
     Stage.JUDGE: stage_judge,
     Stage.REVIEW: stage_review,
+    Stage.POST: stage_post,
 }
 
 
