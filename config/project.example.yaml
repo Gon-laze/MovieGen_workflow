@@ -118,5 +118,5 @@ execution:
   poll_max_attempts: 1
   poll_interval_sec: 0.0
   save_provider_requests: true
-  submission_strategy: primary_only
+  submission_strategy: primary_with_optional_fallback
   allow_optional_provider_live: true

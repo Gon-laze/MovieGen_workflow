@@ -823,3 +823,72 @@
 - 为 `generate` 增加真正的 `retry / backoff / fallback to Vidu`
 - 为 live candidate 增加更细的 `media_probe` 与基础媒体校验
 - 再决定是否把 `post` 从 placeholder 提升为真实后处理入口
+
+## 2026-03-19 Round 19
+
+### 改动
+
+- 为 live 提交增加最小重试能力
+  - `submit_with_retries()`
+  - `download_with_retries()`
+  - 当前复用 `workflow.max_api_retries` 作为 submit/download 最大尝试次数
+- 为下载产物增加最小 `media_probe`
+  - 收集 `path / exists / file_size_bytes / suffix / sha256`
+  - 若本机可用 `ffprobe`，则进一步读取 `duration / width / height / codec_name / stream_count`
+  - probe 结果写入 `.probe.json` 并登记为 `candidate_media_probe` artifact
+- 完整打通 `Kling -> Vidu` live 回退链路
+  - 示例配置 `config/project.example.yaml` 改为 `primary_with_optional_fallback`
+  - 当 `Kling` 未配置或提交失败时，可自动尝试 `Vidu`
+- 修正 job 状态回写
+  - attempted job 会把实际执行 provider/provider_model 覆盖写回 `generation_jobs`
+  - 避免“计划 provider”和“实际执行 provider”混淆运行态排障
+- 修正本地 fake provider 验证环境
+  - 保持 `127.0.0.1 / localhost` 绕过系统代理
+  - 使 fake provider 的 submit/poll/download 验证稳定可复现
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 使用 fake provider 验证 `Kling` 成功闭环：
+  - run_id: `run_20260319_221852_ce5e326c`
+- 使用 fake provider 验证 `Kling -> Vidu` fallback 闭环：
+  - `MOVIEGEN_KLING_*` 置空
+  - `MOVIEGEN_VIDU_*` 指向 fake provider
+  - run_id: `run_20260319_222428_a4c2afbf`
+- 检查：
+  - `workspace/reports/run_20260319_221852_ce5e326c__generate_summary.json`
+  - `workspace/review/run_20260319_221852_ce5e326c__judge_scores.json`
+  - `workspace/reports/run_20260319_222428_a4c2afbf__generate_summary.json`
+  - `workspace/review/run_20260319_222428_a4c2afbf__judge_scores.json`
+  - SQLite `generation_jobs` 实际 provider / status 回写
+
+### 效果
+
+- `Kling` 成功链路已稳定为：
+  - `submit -> poll -> download -> media_probe -> ready_for_judge -> judge`
+- `Kling -> Vidu` 回退链路也已跑通：
+  - 当 `Kling` 未配置时，系统会自动切到 `Vidu`
+  - fallback run `run_20260319_222428_a4c2afbf` 中，3 个镜头都由 `vidu_q3` 下载成功并进入 judge
+- fallback run 的关键结果：
+  - `candidate_count = 3`
+  - `ready_candidate_count = 3`
+  - `provider_request_status_counts` 覆盖了 `not_configured / submitted / completed / downloaded`
+- 每个下载候选现在都带：
+  - `media_artifact_path`
+  - `media_probe`
+  - `.probe.json` artifact
+
+### 问题
+
+- `media_probe` 当前仍是“最小探测”，尚未形成真正的媒体质量门控
+  - 在没有 `ffprobe` 的机器上，只能退化到文件级元数据
+- 当前 fallback 是“provider 级补位”，还不是“prompt/compiler 级重编译后再补位”
+  - 现在是沿用当前 packet 并重映射 provider
+  - 后面如果做更强 provider-specific 控制，最好在 fallback 时重编译 prompt packet
+
+### 下一步
+
+- 给 live `generate` 增加 `provider-specific fallback reason` 与更清晰的 attempt summary
+- 给下载后的 candidate 增加基础 `media_gate`
+  - 例如大小异常、探测失败、无视频流时自动标记为 review/regenerate
+- 再决定是否把 `post` 从 placeholder 提升为真实后处理入口

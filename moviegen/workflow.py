@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -222,6 +224,7 @@ def persist_candidate_record(
     media_artifact_path: str | None = None,
     poll_result: dict[str, Any] | None = None,
     download_result: dict[str, Any] | None = None,
+    media_probe: dict[str, Any] | None = None,
     record_artifact: bool = True,
 ) -> dict[str, Any]:
     candidate_clip_id = candidate_clip_id or f"candidate_{uuid4().hex[:12]}"
@@ -243,6 +246,7 @@ def persist_candidate_record(
         "adapter_result": adapter_result,
         "poll_result": poll_result,
         "download_result": download_result,
+        "media_probe": media_probe,
         "media_artifact_path": media_artifact_path,
         "created_at": now_iso(),
     }
@@ -297,6 +301,7 @@ def poll_until_terminal(adapter: Any, external_job_id: str, spec: ProjectSpec) -
                 "phase": "poll",
                 "attempt_index": attempt,
                 "provider": adapter.provider_name,
+                "mode": latest.get("mode"),
                 "status": latest.get("status"),
                 "external_job_id": external_job_id,
                 "request": latest.get("request"),
@@ -312,6 +317,132 @@ def poll_until_terminal(adapter: Any, external_job_id: str, spec: ProjectSpec) -
         if attempt < attempts and spec.execution.poll_interval_sec > 0:
             time.sleep(spec.execution.poll_interval_sec)
     return latest, poll_events
+
+
+def should_retry_submit(status: str | None) -> bool:
+    return status in {"http_error", "request_failed"}
+
+
+def should_retry_download(status: str | None) -> bool:
+    return status in {"http_error", "download_failed"}
+
+
+def submit_with_retries(adapter: Any, submit_payload: dict[str, Any], spec: ProjectSpec) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
+    max_attempts = max(1, spec.workflow.max_api_retries)
+    latest: dict[str, Any] = {
+        "provider": adapter.provider_name,
+        "mode": "live" if spec.execution.live_mode else "mock",
+        "status": "request_not_started",
+    }
+    for retry_index in range(1, max_attempts + 1):
+        latest = adapter.submit(submit_payload)
+        events.append(
+            {
+                "phase": "submit",
+                "retry_index": retry_index,
+                "provider": adapter.provider_name,
+                "mode": latest.get("mode"),
+                "status": latest.get("status"),
+                "external_job_id": latest.get("external_job_id"),
+                "request": latest.get("request"),
+                "response": latest.get("response"),
+                "error": latest.get("error"),
+            }
+        )
+        if latest.get("status") in LIVE_SUBMIT_SUCCESS_STATUSES:
+            return latest, events
+        if not should_retry_submit(latest.get("status")) or retry_index == max_attempts:
+            return latest, events
+        time.sleep(min(0.5 * retry_index, 2.0))
+    return latest, events
+
+
+def download_with_retries(adapter: Any, asset_url: str | None, media_path: Path, spec: ProjectSpec) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
+    max_attempts = max(1, spec.workflow.max_api_retries)
+    latest: dict[str, Any] = {
+        "provider": adapter.provider_name,
+        "mode": "live" if spec.execution.live_mode else "mock",
+        "status": "download_not_started",
+    }
+    for retry_index in range(1, max_attempts + 1):
+        latest = adapter.download(asset_url, media_path)
+        events.append(
+            {
+                "phase": "download",
+                "retry_index": retry_index,
+                "provider": adapter.provider_name,
+                "mode": latest.get("mode"),
+                "status": latest.get("status"),
+                "download_url": asset_url,
+                "media_path": str(media_path),
+                "response": latest,
+                "error": latest.get("error"),
+            }
+        )
+        if latest.get("status") == "downloaded":
+            return latest, events
+        if not should_retry_download(latest.get("status")) or retry_index == max_attempts:
+            return latest, events
+        time.sleep(min(0.5 * retry_index, 2.0))
+    return latest, events
+
+
+def probe_media_file(path: Path) -> dict[str, Any]:
+    probe = {
+        "path": str(path),
+        "exists": path.exists(),
+        "file_size_bytes": path.stat().st_size if path.exists() else 0,
+        "suffix": path.suffix.lower(),
+        "sha256": sha256_file(path) if path.exists() else None,
+        "ffprobe_available": bool(shutil.which("ffprobe")),
+        "ffprobe_status": "not_run",
+        "duration_sec": None,
+        "width": None,
+        "height": None,
+        "codec_name": None,
+        "stream_count": None,
+    }
+    if not path.exists():
+        probe["ffprobe_status"] = "missing_file"
+        return probe
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        probe["ffprobe_status"] = "ffprobe_unavailable"
+        return probe
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration:stream=codec_type,codec_name,width,height",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+        if result.returncode != 0:
+            probe["ffprobe_status"] = "ffprobe_failed"
+            probe["ffprobe_stderr"] = result.stderr.strip()[:500]
+            return probe
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams", [])
+        video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+        fmt = payload.get("format", {})
+        probe["ffprobe_status"] = "ok"
+        probe["duration_sec"] = float(fmt["duration"]) if fmt.get("duration") not in {None, ""} else None
+        probe["stream_count"] = len(streams)
+        if video_stream:
+            probe["width"] = video_stream.get("width")
+            probe["height"] = video_stream.get("height")
+            probe["codec_name"] = video_stream.get("codec_name")
+        return probe
+    except Exception as exc:  # noqa: BLE001
+        probe["ffprobe_status"] = "ffprobe_exception"
+        probe["ffprobe_error"] = str(exc)
+        return probe
 
 
 def build_live_submission_attempts(spec: ProjectSpec, shot_jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -962,7 +1093,7 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                 submit_payload["submit_provider"] = submit_provider
                 submit_payload["remapped_from_provider"] = remapped_from_provider
                 adapter = resolve_adapter(spec, submit_provider)
-                adapter_result = adapter.submit(submit_payload)
+                adapter_result, submit_events = submit_with_retries(adapter, submit_payload, spec)
                 sync_generation_job_state(
                     ctx,
                     job,
@@ -971,24 +1102,18 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                     actual_provider=submit_provider,
                     actual_provider_model=(packet or {}).get("provider_model", submit_provider),
                 )
-                provider_requests.append(
-                    {
-                        "phase": "submit",
-                        "shot_id": shot_id,
-                        "job_id": job["job_id"],
-                        "attempt_index": attempt_index,
-                        "provider": submit_provider,
-                        "planned_provider": job["provider"],
-                        "remapped_from_provider": remapped_from_provider,
-                        "attempt_reason": attempt["attempt_reason"],
-                        "mode": adapter_result.get("mode"),
-                        "status": adapter_result.get("status"),
-                        "external_job_id": adapter_result.get("external_job_id"),
-                        "request": adapter_result.get("request"),
-                        "response": adapter_result.get("response"),
-                        "error": adapter_result.get("error"),
-                    }
-                )
+                for event in submit_events:
+                    event.update(
+                        {
+                            "shot_id": shot_id,
+                            "job_id": job["job_id"],
+                            "attempt_index": attempt_index,
+                            "planned_provider": job["provider"],
+                            "remapped_from_provider": remapped_from_provider,
+                            "attempt_reason": attempt["attempt_reason"],
+                        }
+                    )
+                provider_requests.extend(submit_events)
                 if adapter_result.get("status") in LIVE_SUBMIT_SUCCESS_STATUSES:
                     candidate_payload = persist_candidate_record(
                         ctx,
@@ -1016,24 +1141,21 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                 / "downloads"
                                 / f"{ctx.run_id}__{shot_id}__{submit_provider}__{candidate_payload['candidate_clip_id']}{infer_media_extension(asset_url)}"
                             )
-                            download_result = adapter.download(asset_url, media_path)
-                            provider_requests.append(
-                                {
-                                    "phase": "download",
-                                    "shot_id": shot_id,
-                                    "job_id": job["job_id"],
-                                    "attempt_index": attempt_index,
-                                    "provider": submit_provider,
-                                    "planned_provider": job["provider"],
-                                    "remapped_from_provider": remapped_from_provider,
-                                    "mode": download_result.get("mode"),
-                                    "status": download_result.get("status"),
-                                    "external_job_id": external_job_id,
-                                    "request": {"download_url": asset_url, "media_path": str(media_path)},
-                                    "response": download_result,
-                                    "error": download_result.get("error"),
-                                }
-                            )
+                            download_result, download_events = download_with_retries(adapter, asset_url, media_path, spec)
+                            for event in download_events:
+                                event.update(
+                                    {
+                                        "shot_id": shot_id,
+                                        "job_id": job["job_id"],
+                                        "attempt_index": attempt_index,
+                                        "planned_provider": job["provider"],
+                                        "remapped_from_provider": remapped_from_provider,
+                                        "external_job_id": external_job_id,
+                                        "mode": download_result.get("mode"),
+                                        "request": {"download_url": asset_url, "media_path": str(media_path)},
+                                    }
+                                )
+                            provider_requests.extend(download_events)
                             if download_result.get("status") == "downloaded":
                                 sync_generation_job_state(
                                     ctx,
@@ -1043,9 +1165,19 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                     actual_provider=submit_provider,
                                     actual_provider_model=(packet or {}).get("provider_model", submit_provider),
                                 )
+                                media_probe = probe_media_file(media_path)
+                                probe_path = media_path.with_suffix(f"{media_path.suffix}.probe.json")
+                                write_json(probe_path, media_probe)
                                 ctx.record_artifact(
                                     path=media_path,
                                     artifact_type="candidate_media",
+                                    source_stage=Stage.GENERATE.value,
+                                    source_id=candidate_payload["candidate_clip_id"],
+                                    retention_policy="cache",
+                                )
+                                ctx.record_artifact(
+                                    path=probe_path,
+                                    artifact_type="candidate_media_probe",
                                     source_stage=Stage.GENERATE.value,
                                     source_id=candidate_payload["candidate_clip_id"],
                                     retention_policy="cache",
@@ -1063,6 +1195,7 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                     media_artifact_path=str(media_path),
                                     poll_result=poll_result,
                                     download_result=download_result,
+                                    media_probe=media_probe,
                                     record_artifact=False,
                                 )
                                 generated_candidates[-1] = candidate_payload
