@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,7 +13,7 @@ from uuid import uuid4
 import yaml
 
 from .models import ORDERED_STAGES, ProjectSpec, Stage
-from .providers import resolve_adapter
+from .providers import TERMINAL_PROVIDER_STATES, infer_media_extension, resolve_adapter
 from .storage import insert_artifact, upsert_candidate_clip, upsert_generation_job, upsert_judge_score
 
 
@@ -163,14 +164,16 @@ def sync_generation_job_state(
     *,
     status: str,
     external_job_id: str | None,
+    actual_provider: str | None = None,
+    actual_provider_model: str | None = None,
 ) -> None:
     upsert_generation_job(
         ctx.conn,
         job_id=job["job_id"],
         shot_id=job["shot_id"],
         packet_id=job.get("packet_id"),
-        provider=job["provider"],
-        provider_model=job.get("provider_model", job["provider"]),
+        provider=actual_provider or job["provider"],
+        provider_model=actual_provider_model or job.get("provider_model", actual_provider or job["provider"]),
         provider_rank=job.get("provider_rank"),
         selected_reason=job.get("selected_reason"),
         archetype=job.get("archetype"),
@@ -215,8 +218,13 @@ def persist_candidate_record(
     adapter_result: dict[str, Any],
     status: str,
     source_type: str,
+    candidate_clip_id: str | None = None,
+    media_artifact_path: str | None = None,
+    poll_result: dict[str, Any] | None = None,
+    download_result: dict[str, Any] | None = None,
+    record_artifact: bool = True,
 ) -> dict[str, Any]:
-    candidate_clip_id = f"candidate_{uuid4().hex[:12]}"
+    candidate_clip_id = candidate_clip_id or f"candidate_{uuid4().hex[:12]}"
     generation_params = (packet or {}).get("generation_params", {})
     candidate_payload = {
         "run_id": ctx.run_id,
@@ -233,6 +241,9 @@ def persist_candidate_record(
         "source_type": source_type,
         "status": status,
         "adapter_result": adapter_result,
+        "poll_result": poll_result,
+        "download_result": download_result,
+        "media_artifact_path": media_artifact_path,
         "created_at": now_iso(),
     }
     candidate_path = (
@@ -259,14 +270,48 @@ def persist_candidate_record(
         status=status,
         created_at=candidate_payload["created_at"],
     )
-    ctx.record_artifact(
-        path=candidate_path,
-        artifact_type="candidate_clip",
-        source_stage=Stage.GENERATE.value,
-        source_id=candidate_clip_id,
-        retention_policy="cache",
-    )
+    if record_artifact:
+        ctx.record_artifact(
+            path=candidate_path,
+            artifact_type="candidate_clip",
+            source_stage=Stage.GENERATE.value,
+            source_id=candidate_clip_id,
+            retention_policy="cache",
+        )
     return candidate_payload
+
+
+def poll_until_terminal(adapter: Any, external_job_id: str, spec: ProjectSpec) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    poll_events: list[dict[str, Any]] = []
+    latest = {
+        "provider": adapter.provider_name,
+        "mode": "live" if spec.execution.live_mode else "mock",
+        "status": "poll_not_started",
+        "external_job_id": external_job_id,
+    }
+    attempts = max(1, spec.execution.poll_max_attempts)
+    for attempt in range(1, attempts + 1):
+        latest = adapter.poll(external_job_id)
+        poll_events.append(
+            {
+                "phase": "poll",
+                "attempt_index": attempt,
+                "provider": adapter.provider_name,
+                "status": latest.get("status"),
+                "external_job_id": external_job_id,
+                "request": latest.get("request"),
+                "response": latest.get("response"),
+                "asset_url": latest.get("asset_url"),
+                "error": latest.get("error"),
+            }
+        )
+        if latest.get("status") in TERMINAL_PROVIDER_STATES:
+            return latest, poll_events
+        if latest.get("status") != "processing":
+            return latest, poll_events
+        if attempt < attempts and spec.execution.poll_interval_sec > 0:
+            time.sleep(spec.execution.poll_interval_sec)
+    return latest, poll_events
 
 
 def build_live_submission_attempts(spec: ProjectSpec, shot_jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -868,6 +913,7 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             )
             provider_requests.append(
                 {
+                    "phase": "submit",
                     "shot_id": job["shot_id"],
                     "job_id": job["job_id"],
                     "attempt_index": 1,
@@ -922,9 +968,12 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                     job,
                     status=adapter_result.get("status", "request_failed"),
                     external_job_id=adapter_result.get("external_job_id"),
+                    actual_provider=submit_provider,
+                    actual_provider_model=(packet or {}).get("provider_model", submit_provider),
                 )
                 provider_requests.append(
                     {
+                        "phase": "submit",
                         "shot_id": shot_id,
                         "job_id": job["job_id"],
                         "attempt_index": attempt_index,
@@ -941,18 +990,161 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                     }
                 )
                 if adapter_result.get("status") in LIVE_SUBMIT_SUCCESS_STATUSES:
-                    generated_candidates.append(
-                        persist_candidate_record(
-                            ctx,
-                            job=job,
-                            packet=packet,
-                            submit_provider=submit_provider,
-                            planned_provider=job["provider"],
-                            adapter_result=adapter_result,
-                            status="submitted",
-                            source_type="provider_submission_receipt",
-                        )
+                    candidate_payload = persist_candidate_record(
+                        ctx,
+                        job=job,
+                        packet=packet,
+                        submit_provider=submit_provider,
+                        planned_provider=job["provider"],
+                        adapter_result=adapter_result,
+                        status="submitted",
+                        source_type="provider_submission_receipt",
                     )
+                    generated_candidates.append(candidate_payload)
+                    external_job_id = adapter_result.get("external_job_id")
+                    if spec.execution.poll_after_submit and external_job_id:
+                        poll_result, poll_events = poll_until_terminal(adapter, external_job_id, spec)
+                        for event in poll_events:
+                            event["shot_id"] = shot_id
+                            event["job_id"] = job["job_id"]
+                        provider_requests.extend(poll_events)
+                        if poll_result.get("status") == "completed":
+                            asset_url = poll_result.get("asset_url")
+                            media_path = (
+                                ctx.root
+                                / "workspace"
+                                / "downloads"
+                                / f"{ctx.run_id}__{shot_id}__{submit_provider}__{candidate_payload['candidate_clip_id']}{infer_media_extension(asset_url)}"
+                            )
+                            download_result = adapter.download(asset_url, media_path)
+                            provider_requests.append(
+                                {
+                                    "phase": "download",
+                                    "shot_id": shot_id,
+                                    "job_id": job["job_id"],
+                                    "attempt_index": attempt_index,
+                                    "provider": submit_provider,
+                                    "planned_provider": job["provider"],
+                                    "remapped_from_provider": remapped_from_provider,
+                                    "mode": download_result.get("mode"),
+                                    "status": download_result.get("status"),
+                                    "external_job_id": external_job_id,
+                                    "request": {"download_url": asset_url, "media_path": str(media_path)},
+                                    "response": download_result,
+                                    "error": download_result.get("error"),
+                                }
+                            )
+                            if download_result.get("status") == "downloaded":
+                                sync_generation_job_state(
+                                    ctx,
+                                    job,
+                                    status="downloaded",
+                                    external_job_id=external_job_id,
+                                    actual_provider=submit_provider,
+                                    actual_provider_model=(packet or {}).get("provider_model", submit_provider),
+                                )
+                                ctx.record_artifact(
+                                    path=media_path,
+                                    artifact_type="candidate_media",
+                                    source_stage=Stage.GENERATE.value,
+                                    source_id=candidate_payload["candidate_clip_id"],
+                                    retention_policy="cache",
+                                )
+                                candidate_payload = persist_candidate_record(
+                                    ctx,
+                                    job=job,
+                                    packet=packet,
+                                    submit_provider=submit_provider,
+                                    planned_provider=job["provider"],
+                                    adapter_result=adapter_result,
+                                    status="ready_for_judge",
+                                    source_type="downloaded_candidate",
+                                    candidate_clip_id=candidate_payload["candidate_clip_id"],
+                                    media_artifact_path=str(media_path),
+                                    poll_result=poll_result,
+                                    download_result=download_result,
+                                    record_artifact=False,
+                                )
+                                generated_candidates[-1] = candidate_payload
+                            else:
+                                sync_generation_job_state(
+                                    ctx,
+                                    job,
+                                    status="download_failed",
+                                    external_job_id=external_job_id,
+                                    actual_provider=submit_provider,
+                                    actual_provider_model=(packet or {}).get("provider_model", submit_provider),
+                                )
+                                candidate_payload = persist_candidate_record(
+                                    ctx,
+                                    job=job,
+                                    packet=packet,
+                                    submit_provider=submit_provider,
+                                    planned_provider=job["provider"],
+                                    adapter_result=adapter_result,
+                                    status="download_failed",
+                                    source_type="provider_submission_receipt",
+                                    candidate_clip_id=candidate_payload["candidate_clip_id"],
+                                    poll_result=poll_result,
+                                    download_result=download_result,
+                                    record_artifact=False,
+                                )
+                                generated_candidates[-1] = candidate_payload
+                        elif poll_result.get("status") == "failed":
+                            sync_generation_job_state(
+                                ctx,
+                                job,
+                                status="provider_failed",
+                                external_job_id=external_job_id,
+                                actual_provider=submit_provider,
+                                actual_provider_model=(packet or {}).get("provider_model", submit_provider),
+                            )
+                            candidate_payload = persist_candidate_record(
+                                ctx,
+                                job=job,
+                                packet=packet,
+                                submit_provider=submit_provider,
+                                planned_provider=job["provider"],
+                                adapter_result=adapter_result,
+                                status="provider_failed",
+                                source_type="provider_submission_receipt",
+                                candidate_clip_id=candidate_payload["candidate_clip_id"],
+                                poll_result=poll_result,
+                                record_artifact=False,
+                            )
+                            generated_candidates[-1] = candidate_payload
+                        elif poll_result.get("status") == "processing":
+                            sync_generation_job_state(
+                                ctx,
+                                job,
+                                status="processing",
+                                external_job_id=external_job_id,
+                                actual_provider=submit_provider,
+                                actual_provider_model=(packet or {}).get("provider_model", submit_provider),
+                            )
+                        elif poll_result.get("status") not in {"processing", "unknown"}:
+                            sync_generation_job_state(
+                                ctx,
+                                job,
+                                status=str(poll_result.get("status") or "submitted"),
+                                external_job_id=external_job_id,
+                                actual_provider=submit_provider,
+                                actual_provider_model=(packet or {}).get("provider_model", submit_provider),
+                            )
+                            candidate_payload = persist_candidate_record(
+                                ctx,
+                                job=job,
+                                packet=packet,
+                                submit_provider=submit_provider,
+                                planned_provider=job["provider"],
+                                adapter_result=adapter_result,
+                                status="submitted",
+                                source_type="provider_submission_receipt",
+                                candidate_clip_id=candidate_payload["candidate_clip_id"],
+                                poll_result=poll_result,
+                                record_artifact=False,
+                            )
+                            generated_candidates[-1] = candidate_payload
                     success = True
                     break
             for job in shot_jobs:
@@ -965,16 +1157,22 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     for entry in provider_requests:
         key = str(entry.get("status") or "unknown")
         status_counts[key] = status_counts.get(key, 0) + 1
+    ready_candidate_count = sum(1 for candidate in generated_candidates if candidate.get("status") in JUDGE_READY_CANDIDATE_STATUSES)
+    submitted_receipt_count = sum(1 for candidate in generated_candidates if candidate.get("status") == "submitted")
     summary = {
         "generate_id": f"generate_{uuid4().hex[:12]}",
         "run_id": ctx.run_id,
         "candidate_count": len(generated_candidates),
+        "ready_candidate_count": ready_candidate_count,
+        "submitted_receipt_count": submitted_receipt_count,
         "candidates": generated_candidates,
         "provider_requests": provider_requests,
         "provider_request_status_counts": status_counts,
         "note": (
             (
-                "Submitted live provider requests and recorded provider submission receipts."
+                "Submitted live provider requests, polled results, and materialized judge-ready candidate media."
+                if ready_candidate_count
+                else "Submitted live provider requests and recorded provider submission receipts."
                 if generated_candidates
                 else "Attempted live provider submission, but no provider submission receipts were created."
             )
@@ -991,7 +1189,15 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     ctx.record_artifact(path=out, artifact_type="report", source_stage=Stage.GENERATE.value)
     if spec.execution.save_provider_requests:
         ctx.record_artifact(path=requests_out, artifact_type="provider_request_log", source_stage=Stage.GENERATE.value, retention_policy="cache")
-    return StageResult(note=summary["note"], artifacts=[out, requests_out] if spec.execution.save_provider_requests else [out], metadata={"candidate_count": len(generated_candidates)})
+    return StageResult(
+        note=summary["note"],
+        artifacts=[out, requests_out] if spec.execution.save_provider_requests else [out],
+        metadata={
+            "candidate_count": len(generated_candidates),
+            "ready_candidate_count": ready_candidate_count,
+            "submitted_receipt_count": submitted_receipt_count,
+        },
+    )
 
 
 def evaluate_candidate(provider: str, archetype: str, grade: str) -> dict[str, Any]:
@@ -1120,7 +1326,7 @@ def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         "judge_scores": judge_entries,
         "skipped_candidates": skipped_candidates,
         "note": (
-            "Computed heuristic judge scores for generated candidate placeholders."
+            "Computed heuristic judge scores for judge-ready candidates."
             if judge_entries
             else "No judge-ready candidates were available for this run."
         ),

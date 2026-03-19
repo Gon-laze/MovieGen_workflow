@@ -118,6 +118,9 @@ class ExecutionSection(BaseModel):
     optional_provider: str = "vidu_q3"
     live_mode: bool = False
     request_timeout_sec: int = Field(default=60, ge=1)
+    poll_after_submit: bool = True
+    poll_max_attempts: int = Field(default=1, ge=1)
+    poll_interval_sec: float = Field(default=0.0, ge=0.0)
     save_provider_requests: bool = True
     submission_strategy: Literal["primary_only", "primary_with_optional_fallback", "planned"] = "primary_only"
     allow_optional_provider_live: bool = True

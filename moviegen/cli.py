@@ -54,6 +54,7 @@ def ensure_runtime_dirs(root: Path) -> None:
         root / "workspace" / "prompts",
         root / "workspace" / "jobs",
         root / "workspace" / "candidates",
+        root / "workspace" / "downloads",
         root / "workspace" / "review",
         root / "workspace" / "post",
         root / "workspace" / "reports",
@@ -93,6 +94,9 @@ def build_summary(spec: ProjectSpec, run_id: str, stages: list[Stage], dry_run: 
         "execution_optional_provider": spec.execution.optional_provider,
         "execution_live_mode": spec.execution.live_mode,
         "execution_submission_strategy": spec.execution.submission_strategy,
+        "execution_poll_after_submit": spec.execution.poll_after_submit,
+        "execution_poll_max_attempts": spec.execution.poll_max_attempts,
+        "execution_poll_interval_sec": spec.execution.poll_interval_sec,
     }
 
 
@@ -122,7 +126,7 @@ def execute_run(
     conn = connect(db_path)
     init_db(conn)
     started_at = now_iso()
-    run_note = "minimal Kling-first live submission is available; polling, download, and final media judging remain pending"
+    run_note = "minimal Kling-first submit/poll/download flow is available; final media-aware judging and provider-specific post are still pending"
     insert_run(
         conn,
         run_id=current_run_id,
@@ -302,8 +306,10 @@ def doctor() -> None:
         "execution_default_optional": "vidu_q3",
         "env": {
             "MOVIEGEN_KLING_SUBMIT_URL": bool(os.getenv("MOVIEGEN_KLING_SUBMIT_URL")),
+            "MOVIEGEN_KLING_POLL_URL_TEMPLATE": bool(os.getenv("MOVIEGEN_KLING_POLL_URL_TEMPLATE")),
             "MOVIEGEN_KLING_TOKEN": bool(os.getenv("MOVIEGEN_KLING_TOKEN")),
             "MOVIEGEN_VIDU_SUBMIT_URL": bool(os.getenv("MOVIEGEN_VIDU_SUBMIT_URL")),
+            "MOVIEGEN_VIDU_POLL_URL_TEMPLATE": bool(os.getenv("MOVIEGEN_VIDU_POLL_URL_TEMPLATE")),
             "MOVIEGEN_VIDU_TOKEN": bool(os.getenv("MOVIEGEN_VIDU_TOKEN")),
         },
     }

@@ -114,6 +114,9 @@ execution:
   optional_provider: vidu_q3
   live_mode: false
   request_timeout_sec: 60
+  poll_after_submit: true
+  poll_max_attempts: 1
+  poll_interval_sec: 0.0
   save_provider_requests: true
   submission_strategy: primary_only
   allow_optional_provider_live: true

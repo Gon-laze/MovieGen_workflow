@@ -748,3 +748,78 @@
 - 接 `Kling` 的 polling / fetch-result 最小闭环
 - 把 `provider_submission_receipt -> downloaded candidate clip` 串起来
 - 再让 `judge` 在拿到真实媒体后恢复评分
+
+## 2026-03-19 Round 18
+
+### 改动
+
+- 为 `Kling-first` provider 补上最小 `submit -> poll -> download` 闭环
+  - `ProviderAdapter` 现在支持 `poll()` 与 `download()`
+  - `KlingAdapter / ViduAdapter` 增加 `POLL_URL_TEMPLATE` 轮询能力
+  - 下载结果会落到 `workspace/downloads/`
+- 扩展 `execution` 配置
+  - `poll_after_submit`
+  - `poll_max_attempts`
+  - `poll_interval_sec`
+- 扩展 `doctor`
+  - 检查 `MOVIEGEN_KLING_POLL_URL_TEMPLATE`
+  - 检查 `MOVIEGEN_VIDU_POLL_URL_TEMPLATE`
+- 强化 `generate`
+  - live 模式下在成功 submit 后执行 polling
+  - polling 完成后尝试下载媒体文件
+  - 下载成功时生成 `candidate_media` artifact，并把候选状态提升到 `ready_for_judge`
+  - `provider_requests` 现在带 `phase=submit|poll|download`
+- 修正本地回环请求
+  - 对 `127.0.0.1 / localhost` 显式绕过系统代理，避免本地 fake provider 被代理链污染成 `HTTP 502`
+- 修正 `generation_jobs` 回写
+  - attempted job 会把实际执行 provider 回写到数据库
+  - 使 `downloaded / processing / provider_failed` 等状态与真实执行 provider 对齐
+- 调整 `judge` 文案
+  - 改为 `Computed heuristic judge scores for judge-ready candidates.`
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 使用本地 fake provider 服务验证 live 闭环
+  - `tmp/fake_provider_server.py`
+  - `tmp/project.live.mockserver.yaml`
+- 先验证 fake provider 自身：
+  - `Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8765/submit'`
+- 再运行 live dry-run：
+  - `python -m moviegen.cli run tmp/project.live.mockserver.yaml --stage all --dry-run`
+  - 最终验证 run_id: `run_20260319_221852_ce5e326c`
+- 检查：
+  - `workspace/reports/run_20260319_221852_ce5e326c__generate_summary.json`
+  - `workspace/review/run_20260319_221852_ce5e326c__judge_scores.json`
+  - `workspace/downloads/`
+  - `generation_jobs` SQLite 状态回写
+
+### 效果
+
+- 这轮 live 闭环已真实跑通：
+  - `submit -> poll -> download -> ready_for_judge -> judge`
+- `run_20260319_221852_ce5e326c` 的关键结果：
+  - `candidate_count = 3`
+  - `ready_candidate_count = 3`
+  - `provider_request_status_counts = { submitted: 3, completed: 3, downloaded: 3 }`
+- `workspace/downloads/` 已真实落盘 3 个媒体文件
+- `judge` 已对 3 个 `ready_for_judge` 候选生成 heuristic 分数
+- SQLite 中已确认 attempted job 的实际 provider 与状态回写正确：
+  - `kling_3_0 + downloaded`
+  - 未实际执行的备选 job 保持 `not_attempted_after_success`
+
+### 问题
+
+- 当前还是“最小 provider 闭环”，并非完整生产链：
+  - 没有 provider webhook / 长轮询
+  - 没有失败重试退避
+  - 没有真实媒体内容分析 judge
+- 当一个原计划 `seedance_2_0` job 被重映射到 `Kling` 执行时，数据库中的该 job 现在会记录为实际执行 provider
+  - 这更利于运行态排障
+  - 但如果后面要同时保留“计划 provider”和“执行 provider”，还需要单独加字段
+
+### 下一步
+
+- 为 `generate` 增加真正的 `retry / backoff / fallback to Vidu`
+- 为 live candidate 增加更细的 `media_probe` 与基础媒体校验
+- 再决定是否把 `post` 从 placeholder 提升为真实后处理入口

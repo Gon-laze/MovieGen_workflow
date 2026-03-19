@@ -336,6 +336,8 @@ def upsert_generation_job(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id) DO UPDATE SET
             packet_id = excluded.packet_id,
+            provider = excluded.provider,
+            provider_model = excluded.provider_model,
             status = excluded.status,
             external_job_id = excluded.external_job_id,
             provider_rank = excluded.provider_rank,
