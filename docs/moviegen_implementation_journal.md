@@ -476,6 +476,48 @@
 - 立刻重跑 `all --dry-run`
 - 只检查最新 `run_id` 的 `candidate_clips / judge_scores / judge_report`
 
+## 2026-03-19 Round 16
+
+### 改动
+
+- 实现最小版 `generate`
+  - 将 `generation_jobs` 转为 mock `candidate_clips`
+- 实现最小版 `judge`
+  - 生成启发式 `judge_scores`
+- 修复异常后遗留的脏 `running` run
+- 验证最新全链路 run：
+  - `run_20260319_150534_2ca394ea`
+
+### 效果
+
+- 当前最小闭环已贯通：
+  - `shot_specs`
+  - `prompt_packets`
+  - `generation_jobs`
+  - `candidate_clips`
+  - `judge_scores`
+- `run_20260319_150534_2ca394ea` 已产出：
+  - `workspace/candidates/*.json`
+  - `workspace/review/run_20260319_150534_2ca394ea__judge_scores.json`
+- SQLite 已确认写入：
+  - `candidate_clips = 6`
+  - `judge_scores = 6`
+- 历史脏状态：
+  - `run_20260319_150343_7c0fefc4`
+  - `run_20260319_150325_e939f7b2`
+  已被回填为 `failed`
+
+### 问题
+
+- `generate` 仍未提交真实 provider
+- `judge` 仍是启发式评分
+- `status --run-id` 默认查看的是指定 run，不会自动跳转到最新一轮
+
+### 下一步
+
+- 若继续本地实现，优先增强 `AI Judge`
+- 若开始接真实 provider，优先接 `Kling`，并保留 `Vidu` 为可选替换项
+
 ## 2026-03-19 Round 15
 
 ### 改动
