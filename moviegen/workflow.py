@@ -1876,6 +1876,123 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     )
 
 
+def stage_assemble(ctx: RunContext, spec: ProjectSpec) -> StageResult:
+    post_path = ctx.root / "workspace" / "post" / f"{ctx.run_id}__post_summary.json"
+    if not post_path.exists():
+        payload = {
+            "assemble_id": f"assemble_{uuid4().hex[:12]}",
+            "run_id": ctx.run_id,
+            "timeline_items": [],
+            "delivery_items": [],
+            "blocked_items": [],
+            "note": "Assemble stage found no post summary for this run.",
+            "created_at": now_iso(),
+        }
+        out = ctx.root / "workspace" / "assemble" / f"{ctx.run_id}__assembly_summary.json"
+        write_json(out, payload)
+        ctx.record_artifact(path=out, artifact_type="assemble_report", source_stage=Stage.ASSEMBLE.value)
+        return StageResult(note=payload["note"], artifacts=[out], metadata=payload)
+
+    post_payload = json.loads(post_path.read_text(encoding="utf-8"))
+    post_candidates = post_payload.get("post_candidates", []) or []
+    blocked_candidates = list(post_payload.get("blocked_candidates", []) or [])
+
+    timeline_items: list[dict[str, Any]] = []
+    delivery_items: list[dict[str, Any]] = []
+    missing_media_items: list[dict[str, Any]] = []
+    sorted_candidates = sorted(post_candidates, key=lambda item: str(item.get("shot_id") or ""))
+    for index, item in enumerate(sorted_candidates, start=1):
+        media_path = Path(str(item.get("media_artifact_path") or ""))
+        timeline_item = {
+            "sequence_index": index,
+            "shot_id": item.get("shot_id"),
+            "candidate_clip_id": item.get("candidate_clip_id"),
+            "provider": item.get("provider"),
+            "planned_provider": item.get("planned_provider"),
+            "media_artifact_path": str(media_path) if media_path else None,
+            "media_exists": bool(media_path and media_path.exists()),
+            "media_gate_status": item.get("media_gate_status"),
+            "weighted_total_score": item.get("weighted_total_score"),
+        }
+        timeline_items.append(timeline_item)
+
+        if not media_path or not media_path.exists():
+            missing_media_items.append(
+                {
+                    "candidate_clip_id": item.get("candidate_clip_id"),
+                    "shot_id": item.get("shot_id"),
+                    "provider": item.get("provider"),
+                    "reason": "missing_media_artifact",
+                }
+            )
+            continue
+
+        delivery_items.append(
+            {
+                "sequence_index": index,
+                "candidate_clip_id": item.get("candidate_clip_id"),
+                "shot_id": item.get("shot_id"),
+                "delivery_filename": f"{index:03d}__{item.get('shot_id')}__{item.get('candidate_clip_id')}{media_path.suffix}",
+                "source_media_path": str(media_path),
+                "provider": item.get("provider"),
+                "planned_provider": item.get("planned_provider"),
+                "media_gate_status": item.get("media_gate_status"),
+                "weighted_total_score": item.get("weighted_total_score"),
+            }
+        )
+
+    blocked_items = blocked_candidates + missing_media_items
+    timeline_manifest = {
+        "assemble_id": f"timeline_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "timeline_items": timeline_items,
+        "created_at": now_iso(),
+    }
+    delivery_manifest = {
+        "delivery_manifest_id": f"delivery_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "source_post_summary": str(post_path),
+        "source_review_gate": post_payload.get("source_review_gate"),
+        "delivery_items": delivery_items,
+        "blocked_items": blocked_items,
+        "created_at": now_iso(),
+    }
+    summary = {
+        "assemble_id": f"assemble_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "timeline_items": timeline_items,
+        "delivery_items": delivery_items,
+        "blocked_items": blocked_items,
+        "counts": {
+            "timeline_items": len(timeline_items),
+            "delivery_items": len(delivery_items),
+            "blocked_items": len(blocked_items),
+        },
+        "note": (
+            f"Prepared assemble timeline for {len(delivery_items)} deliverable candidates."
+            if delivery_items
+            else "Assemble stage found no deliverable candidates."
+        ),
+        "created_at": now_iso(),
+    }
+
+    assemble_dir = ctx.root / "workspace" / "assemble"
+    timeline_path = assemble_dir / f"{ctx.run_id}__timeline_manifest.json"
+    delivery_path = assemble_dir / f"{ctx.run_id}__delivery_manifest.json"
+    summary_path = assemble_dir / f"{ctx.run_id}__assembly_summary.json"
+    write_json(timeline_path, timeline_manifest)
+    write_json(delivery_path, delivery_manifest)
+    write_json(summary_path, summary)
+    ctx.record_artifact(path=timeline_path, artifact_type="timeline_manifest", source_stage=Stage.ASSEMBLE.value)
+    ctx.record_artifact(path=delivery_path, artifact_type="delivery_manifest", source_stage=Stage.ASSEMBLE.value)
+    ctx.record_artifact(path=summary_path, artifact_type="assemble_report", source_stage=Stage.ASSEMBLE.value)
+    return StageResult(
+        note=summary["note"],
+        artifacts=[timeline_path, delivery_path, summary_path],
+        metadata=summary["counts"],
+    )
+
+
 STAGE_HANDLERS = {
     Stage.INGEST: stage_ingest,
     Stage.ANALYZE: stage_analyze,
@@ -1888,6 +2005,7 @@ STAGE_HANDLERS = {
     Stage.JUDGE: stage_judge,
     Stage.REVIEW: stage_review,
     Stage.POST: stage_post,
+    Stage.ASSEMBLE: stage_assemble,
 }
 
 

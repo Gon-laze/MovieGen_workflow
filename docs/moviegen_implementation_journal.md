@@ -1200,3 +1200,60 @@
 
 - 把 `post` 提升为真正的后处理入口
 - 或者把 `approved_candidates` 继续送入 `assemble`，形成最小交付链路
+
+## 2026-03-19 Round 25
+
+### 改动
+
+- 把 `assemble` 从 placeholder 提升为真实阶段
+  - 消费 `post_summary`
+  - 输出三类真实产物：
+    - `timeline_manifest.json`
+    - `delivery_manifest.json`
+    - `assembly_summary.json`
+- `assemble` 现在会整理：
+  - `timeline_items`
+  - `delivery_items`
+  - `blocked_items`
+- 对每个可交付候选生成稳定交付文件名
+  - 形式：`001__SHOT_ID__candidate_id.ext`
+- 对缺失媒体的候选会进入 `blocked_items`
+  - 便于后续交付前排障
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 直接使用现有 post project 继续验证：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260319_230940_377a6d2c`
+- 检查：
+  - `workspace/assemble/run_20260319_230940_377a6d2c__timeline_manifest.json`
+  - `workspace/assemble/run_20260319_230940_377a6d2c__delivery_manifest.json`
+  - `workspace/assemble/run_20260319_230940_377a6d2c__assembly_summary.json`
+  - `status --run-id run_20260319_230940_377a6d2c`
+
+### 效果
+
+- `post -> assemble -> report` 最小交付链已跑通
+- `run_20260319_230940_377a6d2c` 中：
+  - `timeline_items = 2`
+  - `delivery_items = 2`
+  - `blocked_items = 0`
+- `delivery_manifest` 已真实包含：
+  - source post summary
+  - source review gate
+  - 每个交付项的稳定文件名、来源媒体路径、provider、score
+- `assembly_summary` 已真实包含：
+  - 时间线排序后的候选列表
+  - 可交付项列表
+  - 被阻塞项列表
+
+### 问题
+
+- `assemble` 现在还是 manifest 层，不会真正复制或导出交付文件到独立 release 目录
+- `report` 仍是 placeholder；虽然 run summary 已经存在，但还没有单独的“交付报告”阶段逻辑
+
+### 下一步
+
+- 给 `assemble` 增加真正的 release/export 目录产物
+- 或者把 `report` 从 placeholder 提升为真实交付报告阶段

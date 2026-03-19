@@ -58,6 +58,7 @@ def ensure_runtime_dirs(root: Path) -> None:
         root / "workspace" / "downloads",
         root / "workspace" / "review",
         root / "workspace" / "post",
+        root / "workspace" / "assemble",
         root / "workspace" / "reports",
         root / "workspace" / "logs" / "runs",
         root / "workspace" / "logs" / "stages",
