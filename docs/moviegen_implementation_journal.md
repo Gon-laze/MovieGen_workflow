@@ -517,6 +517,35 @@
 
 - 运行 `moviegen doctor`
 - 运行新的 `all --dry-run`
+- 复核 `provider_requests.json` 与 `generate_summary`
+
+### 效果
+
+- `doctor` 已能显示：
+  - `Kling` 为默认主 provider
+  - `Vidu` 为默认可选替换项
+  - 当前环境变量是否已配置
+- 最新 provider 请求验证基线：
+  - `run_20260319_152023_f9c4c04a`
+- `workspace/jobs/run_20260319_152023_f9c4c04a__provider_requests.json` 已成功落盘
+- `generate_summary` 已包含 `provider_requests`
+
+### 问题
+
+- `seedance_2_0` 目前仍走 generic request body
+- 真实 live submit 仍未启用，因为环境变量尚未配置
+
+### 下一步
+
+- 若继续接真实平台，优先细化 `Kling` 的 live request payload
+- 若继续本地闭环，优先增强 `AI Judge`
+
+## 2026-03-19 Round 18
+
+### 改动
+
+- 运行 `moviegen doctor`
+- 运行新的 `all --dry-run`
 - 验证：
   - `provider_requests.json`
   - `generate_summary`
@@ -651,3 +680,71 @@
 
 - 修正历史遗留的 `running` 记录
 - 再跑一轮 `all --dry-run`，确认新的异常收口逻辑不影响正常成功路径
+
+## 2026-03-19 Round 17
+
+### 改动
+
+- 补强 `generate` 的 `Kling-first` live 提交流程
+  - 以 `shot_id` 聚合 `generation_jobs`
+  - live 模式下按 `submission_strategy` 生成提交尝试序列
+  - 默认主提交通道为 `Kling`，可选替换通道为 `Vidu`
+- 为 live 提交补上状态回写
+  - `generation_jobs.status` 现在会回写为 `submitted / not_configured / unsupported_provider / suppressed_by_strategy` 等真实状态
+  - `external_job_id` 会在成功提交时回写到数据库
+- 修正 `judge` 的候选读取范围
+  - `candidate` 文件名改为带 `run_id`
+  - `judge` 只读取当前 run 的候选，而不是扫全局 `workspace/candidates`
+- 修正 live 提交后的 judge 行为
+  - 只有 `ready / ready_for_judge` 候选会进入 heuristic judge
+  - `provider_submission_receipt` 类型不会被误判为可评审成片
+- 修正 provider 适配解析
+  - `kling_3_0` 固定走 `KlingAdapter`
+  - `vidu_q3` 固定走 `ViduAdapter`
+  - 其他 provider 在 live 模式下明确返回 `unsupported_provider`，不再伪装成可提交成功
+- 补充 run summary
+  - 输出 `execution_primary_provider / execution_optional_provider / execution_live_mode / execution_submission_strategy`
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 运行默认 dry-run：
+  - `python -m moviegen.cli run config/project.example.yaml --stage all --dry-run`
+  - run_id: `run_20260319_215425_91db3ff8`
+- 运行临时 live 配置 dry-run：
+  - `python -m moviegen.cli run tmp/project.live.test.yaml --stage all --dry-run`
+  - run_id: `run_20260319_215436_846266c4`
+- 检查：
+  - `workspace/reports/run_20260319_215425_91db3ff8__generate_summary.json`
+  - `workspace/review/run_20260319_215425_91db3ff8__judge_scores.json`
+  - `workspace/reports/run_20260319_215436_846266c4__generate_summary.json`
+  - `workspace/review/run_20260319_215436_846266c4__judge_scores.json`
+  - `python -m moviegen.cli status --run-id run_20260319_215436_846266c4`
+
+### 效果
+
+- 默认 dry-run 仍保持最小闭环：
+  - `prompt_packets -> generation_jobs -> mock candidates -> judge_scores`
+- live 模式在未配置 `MOVIEGEN_KLING_SUBMIT_URL / MOVIEGEN_KLING_TOKEN` 时会稳定返回：
+  - `not_configured`
+  - 且不会生成可进入 judge 的伪候选
+- 本轮 live 验证中，数据库里的 `generation_jobs` 已出现预期状态：
+  - rank1 job: `not_configured`
+  - 其余未执行 job: `suppressed_by_strategy`
+- `judge` 现在按 run 隔离，不会再误扫历史 run 的候选文件
+
+### 问题
+
+- 当前 live 提交只做到“提交请求 + 回写状态 + 生成提交回执”，尚未实现：
+  - provider polling
+  - result download
+  - 真正视频文件落盘后的 judge
+- `primary_only` 策略下，A 档非 `Kling` 路由镜头仍会被重映射到 `Kling`
+  - 这能保证主通道统一
+  - 但不等于 provider-specific prompt 已完全针对 `Kling` 重编译
+
+### 下一步
+
+- 接 `Kling` 的 polling / fetch-result 最小闭环
+- 把 `provider_submission_receipt -> downloaded candidate clip` 串起来
+- 再让 `judge` 在拿到真实媒体后恢复评分

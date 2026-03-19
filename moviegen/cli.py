@@ -89,6 +89,10 @@ def build_summary(spec: ProjectSpec, run_id: str, stages: list[Stage], dry_run: 
         "benchmark_suite_id": spec.benchmark.suite_id,
         "benchmark_must_test": spec.benchmark.must_test,
         "routing_keys": sorted(spec.routing.route_matrix.keys()),
+        "execution_primary_provider": spec.execution.primary_provider,
+        "execution_optional_provider": spec.execution.optional_provider,
+        "execution_live_mode": spec.execution.live_mode,
+        "execution_submission_strategy": spec.execution.submission_strategy,
     }
 
 
@@ -118,7 +122,7 @@ def execute_run(
     conn = connect(db_path)
     init_db(conn)
     started_at = now_iso()
-    run_note = "scaffold execution only; no live provider integration yet"
+    run_note = "minimal Kling-first live submission is available; polling, download, and final media judging remain pending"
     insert_run(
         conn,
         run_id=current_run_id,

@@ -200,13 +200,24 @@ class ViduAdapter(ProviderAdapter):
 
 
 class GenericAdapter(ProviderAdapter):
-    pass
+    def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request_payload = self.build_request(payload)
+        if self.live_mode:
+            return {
+                "provider": self.provider_name,
+                "mode": "live",
+                "status": "unsupported_provider",
+                "external_job_id": None,
+                "request": request_payload,
+                "error": f"Live submission is not implemented for provider '{self.provider_name}'",
+            }
+        return super().submit(payload)
 
 
 def resolve_adapter(spec: ProjectSpec, provider_name: str) -> ProviderAdapter:
     live_mode = spec.execution.live_mode
-    if provider_name == spec.execution.primary_provider:
+    if provider_name == "kling_3_0":
         return KlingAdapter(live_mode=live_mode, timeout_sec=spec.execution.request_timeout_sec)
-    if provider_name == spec.execution.optional_provider:
+    if provider_name == "vidu_q3":
         return ViduAdapter(live_mode=live_mode, timeout_sec=spec.execution.request_timeout_sec)
     return GenericAdapter(provider_name=provider_name, live_mode=live_mode, timeout_sec=spec.execution.request_timeout_sec)

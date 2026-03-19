@@ -145,6 +145,189 @@ class RunContext:
         )
 
 
+LIVE_SUBMIT_SUCCESS_STATUSES = {"queued", "submitted"}
+JUDGE_READY_CANDIDATE_STATUSES = {"ready", "ready_for_judge"}
+
+
+def serialize_fallback_chain(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def sync_generation_job_state(
+    ctx: RunContext,
+    job: dict[str, Any],
+    *,
+    status: str,
+    external_job_id: str | None,
+) -> None:
+    upsert_generation_job(
+        ctx.conn,
+        job_id=job["job_id"],
+        shot_id=job["shot_id"],
+        packet_id=job.get("packet_id"),
+        provider=job["provider"],
+        provider_model=job.get("provider_model", job["provider"]),
+        provider_rank=job.get("provider_rank"),
+        selected_reason=job.get("selected_reason"),
+        archetype=job.get("archetype"),
+        grade=job.get("grade"),
+        budget_class=job.get("budget_class"),
+        estimated_cost_usd=job.get("estimated_cost_usd"),
+        queue_policy=job.get("queue_policy"),
+        fallback_chain=serialize_fallback_chain(job.get("fallback_chain")),
+        status=status,
+        external_job_id=external_job_id,
+        created_at=job.get("created_at", now_iso()),
+        updated_at=now_iso(),
+    )
+
+
+def select_submit_packet(
+    job: dict[str, Any],
+    submit_provider: str,
+    packet_index_by_id: dict[str, dict[str, Any]],
+    packet_index_by_shot_provider: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any] | None:
+    direct_packet = packet_index_by_shot_provider.get((job["shot_id"], submit_provider))
+    if direct_packet is not None:
+        return dict(direct_packet)
+    fallback_packet = packet_index_by_id.get(job.get("packet_id"))
+    if fallback_packet is None:
+        return None
+    packet = dict(fallback_packet)
+    if submit_provider != packet.get("provider"):
+        packet["provider"] = submit_provider
+        packet["provider_model"] = submit_provider
+    return packet
+
+
+def persist_candidate_record(
+    ctx: RunContext,
+    *,
+    job: dict[str, Any],
+    packet: dict[str, Any] | None,
+    submit_provider: str,
+    planned_provider: str,
+    adapter_result: dict[str, Any],
+    status: str,
+    source_type: str,
+) -> dict[str, Any]:
+    candidate_clip_id = f"candidate_{uuid4().hex[:12]}"
+    generation_params = (packet or {}).get("generation_params", {})
+    candidate_payload = {
+        "run_id": ctx.run_id,
+        "candidate_clip_id": candidate_clip_id,
+        "job_id": job["job_id"],
+        "shot_id": job["shot_id"],
+        "provider": submit_provider,
+        "planned_provider": planned_provider,
+        "provider_model": (packet or {}).get("provider_model", submit_provider),
+        "external_job_id": adapter_result.get("external_job_id"),
+        "duration_sec": generation_params.get("duration_sec", 0.0),
+        "resolution": generation_params.get("resolution_tier", "unknown"),
+        "has_native_audio": bool(generation_params.get("native_audio", False)),
+        "source_type": source_type,
+        "status": status,
+        "adapter_result": adapter_result,
+        "created_at": now_iso(),
+    }
+    candidate_path = (
+        ctx.root
+        / "workspace"
+        / "candidates"
+        / f"{ctx.run_id}__{job['shot_id']}__{submit_provider}__{candidate_clip_id}.json"
+    )
+    write_json(candidate_path, candidate_payload)
+    artifact_hash = sha256_file(candidate_path)
+    upsert_candidate_clip(
+        ctx.conn,
+        candidate_clip_id=candidate_clip_id,
+        job_id=job["job_id"],
+        shot_id=job["shot_id"],
+        provider=submit_provider,
+        provider_model=candidate_payload["provider_model"],
+        artifact_path=str(candidate_path),
+        duration_sec=float(candidate_payload["duration_sec"]),
+        resolution=str(candidate_payload["resolution"]),
+        has_native_audio=bool(candidate_payload["has_native_audio"]),
+        source_type=source_type,
+        artifact_hash=artifact_hash,
+        status=status,
+        created_at=candidate_payload["created_at"],
+    )
+    ctx.record_artifact(
+        path=candidate_path,
+        artifact_type="candidate_clip",
+        source_stage=Stage.GENERATE.value,
+        source_id=candidate_clip_id,
+        retention_policy="cache",
+    )
+    return candidate_payload
+
+
+def build_live_submission_attempts(spec: ProjectSpec, shot_jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not shot_jobs:
+        return []
+    primary = spec.execution.primary_provider
+    optional = spec.execution.optional_provider
+    strategy = spec.execution.submission_strategy
+    first_job = shot_jobs[0]
+    if strategy == "primary_only":
+        return [
+            {
+                "job": first_job,
+                "submit_provider": primary,
+                "remapped_from_provider": first_job["provider"] if first_job["provider"] != primary else None,
+                "attempt_reason": "primary_only",
+            }
+        ]
+    if strategy == "primary_with_optional_fallback":
+        attempts = [
+            {
+                "job": first_job,
+                "submit_provider": primary,
+                "remapped_from_provider": first_job["provider"] if first_job["provider"] != primary else None,
+                "attempt_reason": "primary_first",
+            }
+        ]
+        if optional != primary and spec.execution.allow_optional_provider_live:
+            attempts.append(
+                {
+                    "job": first_job,
+                    "submit_provider": optional,
+                    "remapped_from_provider": first_job["provider"] if first_job["provider"] != optional else None,
+                    "attempt_reason": "optional_fallback",
+                }
+            )
+        return attempts
+    attempts: list[dict[str, Any]] = []
+    for job in shot_jobs:
+        if job["provider"] == optional and not spec.execution.allow_optional_provider_live:
+            continue
+        attempts.append(
+            {
+                "job": job,
+                "submit_provider": job["provider"],
+                "remapped_from_provider": None,
+                "attempt_reason": "planned",
+            }
+        )
+    if attempts:
+        return attempts
+    return [
+        {
+            "job": first_job,
+            "submit_provider": primary,
+            "remapped_from_provider": first_job["provider"] if first_job["provider"] != primary else None,
+            "attempt_reason": "planned_fallback_to_primary",
+        }
+    ]
+
+
 def stage_ingest(ctx: RunContext, spec: ProjectSpec, project_file: Path) -> StageResult:
     imported_assets: list[dict[str, Any]] = []
     failed_assets: list[dict[str, Any]] = []
@@ -658,101 +841,146 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     if packets_path.exists():
         packets = json.loads(packets_path.read_text(encoding="utf-8")).get("packets", [])
     packet_index = {packet["packet_id"]: packet for packet in packets}
+    packet_index_by_shot_provider = {(packet["shot_id"], packet["provider"]): packet for packet in packets}
 
-    candidate_dir = ctx.root / "workspace" / "candidates"
     generated_candidates: list[dict[str, Any]] = []
     provider_requests: list[dict[str, Any]] = []
+    jobs_by_shot: dict[str, list[dict[str, Any]]] = {}
     for job in routed_jobs:
-        submit_provider = job["provider"]
-        remapped_from_provider = None
-        if spec.execution.live_mode:
-            strategy = spec.execution.submission_strategy
-            if strategy == "primary_only":
-                if submit_provider != spec.execution.primary_provider:
-                    remapped_from_provider = submit_provider
-                    submit_provider = spec.execution.primary_provider
-            elif strategy == "primary_with_optional_fallback":
-                if submit_provider not in {spec.execution.primary_provider, spec.execution.optional_provider}:
-                    remapped_from_provider = submit_provider
-                    submit_provider = spec.execution.primary_provider
-                if submit_provider == spec.execution.optional_provider and not spec.execution.allow_optional_provider_live:
-                    remapped_from_provider = submit_provider
-                    submit_provider = spec.execution.primary_provider
+        jobs_by_shot.setdefault(job["shot_id"], []).append(job)
 
-        packet = packet_index.get(job.get("packet_id"))
-        submit_payload = dict(job)
-        if packet:
-            submit_payload.update(packet)
-        submit_payload["planned_provider"] = job["provider"]
-        submit_payload["submit_provider"] = submit_provider
-        submit_payload["remapped_from_provider"] = remapped_from_provider
+    if not spec.execution.live_mode:
+        for job in routed_jobs:
+            packet = packet_index.get(job.get("packet_id"))
+            submit_payload = dict(job)
+            if packet:
+                submit_payload.update(packet)
+            submit_payload["planned_provider"] = job["provider"]
+            submit_payload["submit_provider"] = job["provider"]
+            submit_payload["remapped_from_provider"] = None
+            adapter = resolve_adapter(spec, job["provider"])
+            adapter_result = adapter.submit(submit_payload)
+            sync_generation_job_state(
+                ctx,
+                job,
+                status=adapter_result.get("status", "queued"),
+                external_job_id=adapter_result.get("external_job_id"),
+            )
+            provider_requests.append(
+                {
+                    "shot_id": job["shot_id"],
+                    "job_id": job["job_id"],
+                    "attempt_index": 1,
+                    "provider": job["provider"],
+                    "planned_provider": job["provider"],
+                    "remapped_from_provider": None,
+                    "attempt_reason": "dry_run_or_mock",
+                    "mode": adapter_result.get("mode"),
+                    "status": adapter_result.get("status"),
+                    "external_job_id": adapter_result.get("external_job_id"),
+                    "request": adapter_result.get("request"),
+                    "response": adapter_result.get("response"),
+                    "error": adapter_result.get("error"),
+                }
+            )
+            generated_candidates.append(
+                persist_candidate_record(
+                    ctx,
+                    job=job,
+                    packet=packet,
+                    submit_provider=job["provider"],
+                    planned_provider=job["provider"],
+                    adapter_result=adapter_result,
+                    status="ready",
+                    source_type="mock_candidate",
+                )
+            )
+    else:
+        for shot_id in sorted(jobs_by_shot):
+            shot_jobs = sorted(jobs_by_shot[shot_id], key=lambda item: int(item.get("provider_rank") or 999))
+            attempts = build_live_submission_attempts(spec, shot_jobs)
+            attempted_job_ids: set[str] = set()
+            success = False
+            for attempt_index, attempt in enumerate(attempts, start=1):
+                job = attempt["job"]
+                submit_provider = attempt["submit_provider"]
+                remapped_from_provider = attempt["remapped_from_provider"]
+                attempted_job_ids.add(job["job_id"])
+                packet = select_submit_packet(job, submit_provider, packet_index, packet_index_by_shot_provider)
+                submit_payload = dict(job)
+                if packet:
+                    submit_payload.update(packet)
+                submit_payload["provider"] = submit_provider
+                submit_payload["provider_model"] = (packet or {}).get("provider_model", submit_provider)
+                submit_payload["planned_provider"] = job["provider"]
+                submit_payload["submit_provider"] = submit_provider
+                submit_payload["remapped_from_provider"] = remapped_from_provider
+                adapter = resolve_adapter(spec, submit_provider)
+                adapter_result = adapter.submit(submit_payload)
+                sync_generation_job_state(
+                    ctx,
+                    job,
+                    status=adapter_result.get("status", "request_failed"),
+                    external_job_id=adapter_result.get("external_job_id"),
+                )
+                provider_requests.append(
+                    {
+                        "shot_id": shot_id,
+                        "job_id": job["job_id"],
+                        "attempt_index": attempt_index,
+                        "provider": submit_provider,
+                        "planned_provider": job["provider"],
+                        "remapped_from_provider": remapped_from_provider,
+                        "attempt_reason": attempt["attempt_reason"],
+                        "mode": adapter_result.get("mode"),
+                        "status": adapter_result.get("status"),
+                        "external_job_id": adapter_result.get("external_job_id"),
+                        "request": adapter_result.get("request"),
+                        "response": adapter_result.get("response"),
+                        "error": adapter_result.get("error"),
+                    }
+                )
+                if adapter_result.get("status") in LIVE_SUBMIT_SUCCESS_STATUSES:
+                    generated_candidates.append(
+                        persist_candidate_record(
+                            ctx,
+                            job=job,
+                            packet=packet,
+                            submit_provider=submit_provider,
+                            planned_provider=job["provider"],
+                            adapter_result=adapter_result,
+                            status="submitted",
+                            source_type="provider_submission_receipt",
+                        )
+                    )
+                    success = True
+                    break
+            for job in shot_jobs:
+                if job["job_id"] in attempted_job_ids:
+                    continue
+                residual_status = "not_attempted_after_success" if success else "suppressed_by_strategy"
+                sync_generation_job_state(ctx, job, status=residual_status, external_job_id=None)
 
-        adapter = resolve_adapter(spec, submit_provider)
-        adapter_result = adapter.submit(submit_payload)
-        provider_requests.append(
-            {
-                "job_id": job["job_id"],
-                "provider": submit_provider,
-                "planned_provider": job["provider"],
-                "remapped_from_provider": remapped_from_provider,
-                "mode": adapter_result.get("mode"),
-                "status": adapter_result.get("status"),
-                "request": adapter_result.get("request"),
-                "response": adapter_result.get("response"),
-                "error": adapter_result.get("error"),
-            }
-        )
-        candidate_clip_id = f"candidate_{uuid4().hex[:12]}"
-        candidate_payload = {
-            "candidate_clip_id": candidate_clip_id,
-            "job_id": job["job_id"],
-            "shot_id": job["shot_id"],
-            "provider": submit_provider,
-            "planned_provider": job["provider"],
-            "provider_model": packet["provider_model"] if packet else job["provider_model"],
-            "duration_sec": (packet or {}).get("generation_params", {}).get("duration_sec", 0.0),
-            "resolution": (packet or {}).get("generation_params", {}).get("resolution_tier", "unknown"),
-            "has_native_audio": bool((packet or {}).get("generation_params", {}).get("native_audio", False)),
-            "source_type": "planned_generation",
-            "status": "ready",
-            "adapter_result": adapter_result,
-            "created_at": now_iso(),
-        }
-        candidate_path = candidate_dir / f"{job['shot_id']}__{submit_provider}__{candidate_clip_id}.json"
-        write_json(candidate_path, candidate_payload)
-        artifact_hash = sha256_file(candidate_path)
-        upsert_candidate_clip(
-            ctx.conn,
-            candidate_clip_id=candidate_clip_id,
-            job_id=job["job_id"],
-            shot_id=job["shot_id"],
-            provider=submit_provider,
-            provider_model=(packet or {}).get("provider_model", job["provider_model"]),
-            artifact_path=str(candidate_path),
-            duration_sec=float(candidate_payload["duration_sec"]),
-            resolution=str(candidate_payload["resolution"]),
-            has_native_audio=bool(candidate_payload["has_native_audio"]),
-            source_type="planned_generation",
-            artifact_hash=artifact_hash,
-            status="ready",
-            created_at=now_iso(),
-        )
-        ctx.record_artifact(
-            path=candidate_path,
-            artifact_type="candidate_clip",
-            source_stage=Stage.GENERATE.value,
-            source_id=candidate_clip_id,
-            retention_policy="cache",
-        )
-        generated_candidates.append(candidate_payload)
-
+    status_counts: dict[str, int] = {}
+    for entry in provider_requests:
+        key = str(entry.get("status") or "unknown")
+        status_counts[key] = status_counts.get(key, 0) + 1
     summary = {
         "generate_id": f"generate_{uuid4().hex[:12]}",
         "run_id": ctx.run_id,
         "candidate_count": len(generated_candidates),
         "candidates": generated_candidates,
         "provider_requests": provider_requests,
-        "note": "Created mock candidate clip placeholders from generation jobs.",
+        "provider_request_status_counts": status_counts,
+        "note": (
+            (
+                "Submitted live provider requests and recorded provider submission receipts."
+                if generated_candidates
+                else "Attempted live provider submission, but no provider submission receipts were created."
+            )
+            if spec.execution.live_mode
+            else "Created mock candidate clip placeholders from generation jobs."
+        ),
         "created_at": now_iso(),
     }
     out = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__generate_summary.json"
@@ -839,10 +1067,21 @@ def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     job_index = {job["job_id"]: job for job in routed_jobs}
 
     candidate_dir = ctx.root / "workspace" / "candidates"
-    candidates = sorted(candidate_dir.glob("*.json"))
+    candidates = sorted(candidate_dir.glob(f"{ctx.run_id}__*.json"))
     judge_entries: list[dict[str, Any]] = []
+    skipped_candidates: list[dict[str, Any]] = []
     for candidate_path in candidates:
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        if candidate.get("status") not in JUDGE_READY_CANDIDATE_STATUSES:
+            skipped_candidates.append(
+                {
+                    "candidate_clip_id": candidate["candidate_clip_id"],
+                    "shot_id": candidate["shot_id"],
+                    "provider": candidate["provider"],
+                    "reason": f"candidate_status:{candidate.get('status')}",
+                }
+            )
+            continue
         job = job_index.get(candidate["job_id"], {})
         evaluation = evaluate_candidate(candidate["provider"], job.get("archetype", "insert_cutaway"), job.get("grade", "B"))
         judge_score_id = f"judge_{uuid4().hex[:12]}"
@@ -879,7 +1118,12 @@ def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         "judge_id": f"judge_{uuid4().hex[:12]}",
         "run_id": ctx.run_id,
         "judge_scores": judge_entries,
-        "note": "Computed heuristic judge scores for generated candidate placeholders.",
+        "skipped_candidates": skipped_candidates,
+        "note": (
+            "Computed heuristic judge scores for generated candidate placeholders."
+            if judge_entries
+            else "No judge-ready candidates were available for this run."
+        ),
         "created_at": now_iso(),
     }
     out = ctx.root / "workspace" / "review" / f"{ctx.run_id}__judge_scores.json"
