@@ -1,0 +1,106 @@
+shot_specs:
+  - shot_id: SHOT_001
+    scene_id: SCENE_001
+    sequence_id: SEQ_001
+    grade: B
+    archetype: narrative_multi_shot
+    story_purpose: 建立主线叙事，测试多镜头连续性
+    duration_target_sec: 12
+    aspect_ratio: 2.39:1
+    subject: 女主在空间站走廊回头观察
+    location: 金属走廊
+    action: 缓慢前行后停下转身
+    camera: 中景跟拍
+    style: 2000-2015 写实科幻
+    needs_native_audio: false
+    needs_reference_consistency: true
+    needs_motion_control: false
+    continuity:
+      character_ids: [char_lead_001]
+      wardrobe_ids: [wd_lead_default]
+      location_id: loc_primary_001
+      prop_ids: []
+    references:
+      image_refs: []
+      video_refs: []
+      text_refs: []
+    provider_constraints:
+      allowed_providers: []
+      banned_providers: []
+      preferred_first_tier: true
+    post_requirements:
+      lip_sync: false
+      interpolation: false
+      upscale: true
+      color_match: true
+    budget_class: standard
+  - shot_id: SHOT_002
+    scene_id: SCENE_002
+    sequence_id: SEQ_001
+    grade: B
+    archetype: motion_control
+    story_purpose: 测试动作控制与姿态稳定
+    duration_target_sec: 8
+    aspect_ratio: 16:9
+    subject: 主角快速转身举起设备
+    location: 控制室
+    action: 动作驱动镜头
+    camera: 近中景
+    style: 2000-2015 写实科幻
+    needs_native_audio: false
+    needs_reference_consistency: true
+    needs_motion_control: true
+    continuity:
+      character_ids: [char_lead_001]
+      wardrobe_ids: [wd_lead_default]
+      location_id: loc_primary_001
+      prop_ids: []
+    references:
+      image_refs: []
+      video_refs: []
+      text_refs: []
+    provider_constraints:
+      allowed_providers: []
+      banned_providers: []
+      preferred_first_tier: true
+    post_requirements:
+      lip_sync: false
+      interpolation: false
+      upscale: true
+      color_match: true
+    budget_class: standard
+  - shot_id: SHOT_003
+    scene_id: SCENE_003
+    sequence_id: SEQ_002
+    grade: B
+    archetype: dialogue_native_audio
+    story_purpose: 测试多人对话与原生音频
+    duration_target_sec: 10
+    aspect_ratio: 16:9
+    subject: 两人面对面低声交谈
+    location: 狭小舱室
+    action: 对话
+    camera: 过肩镜头
+    style: 2000-2015 写实科幻
+    needs_native_audio: true
+    needs_reference_consistency: true
+    needs_motion_control: false
+    continuity:
+      character_ids: [char_lead_001]
+      wardrobe_ids: [wd_lead_default]
+      location_id: loc_primary_001
+      prop_ids: []
+    references:
+      image_refs: []
+      video_refs: []
+      text_refs: []
+    provider_constraints:
+      allowed_providers: []
+      banned_providers: []
+      preferred_first_tier: false
+    post_requirements:
+      lip_sync: true
+      interpolation: false
+      upscale: true
+      color_match: true
+    budget_class: standard

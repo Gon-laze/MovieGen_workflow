@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moviegen-workflow"
+version = "0.1.0"
+description = "MovieGen workflow scaffold and CLI."
+readme = "docs/moviegen_master_workflow_spec.md"
+requires-python = ">=3.12"
+dependencies = [
+  "typer>=0.9,<1.0",
+  "pydantic>=2.8,<3.0",
+  "PyYAML>=6,<7",
+]
+
+[project.scripts]
+moviegen = "moviegen.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["moviegen*"]

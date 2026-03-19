@@ -1,0 +1,110 @@
+project:
+  id: moviegen_scifi_001
+  title: My Sci-Fi Feature
+  language: zh-CN
+  target_runtime_min: 120
+  budget_usd_cap: 800
+
+references:
+  video_dirs:
+    - input/reference_videos
+  image_dirs:
+    - input/reference_images
+  text_notes:
+    - docs/moviegen_master_workflow_spec.md
+    - input/notes
+
+style:
+  target_era: "2000-2015 realistic sci-fi"
+  tone_keywords:
+    - restrained
+    - cinematic
+    - low saturation
+
+providers:
+  preferred_a_pool:
+    - veo_3_1_fast
+    - veo_3_fast
+    - veo_3_1
+    - runway_gen_4_5
+  preferred_b_pool:
+    - seedance_2_0
+    - kling_3_0
+    - runway_gen_4
+    - vidu_q3
+    - hailuo_current
+  preferred_c_pool:
+    - vidu_q3
+    - hailuo_current
+    - wan
+    - comfyui
+
+workflow:
+  enable_human_gates: true
+  max_api_retries: 3
+  budget_warning_ratio: 0.8
+  budget_hard_stop_ratio: 1.0
+
+benchmark:
+  suite_id: benchmark_suite_v1
+  must_test:
+    - seedance_2_0
+    - kling_3_0
+  optional_test:
+    - runway_gen_4
+    - vidu_q3
+    - hailuo_current
+  weights:
+    task_ceiling: 0.25
+    continuity: 0.20
+    motion_stability: 0.15
+    identity_consistency: 0.15
+    instruction_fidelity: 0.10
+    camera_control: 0.10
+    cost_efficiency: 0.05
+  thresholds:
+    minimum_total_score: 7.5
+    minimum_task_ceiling_for_tier1: 8.0
+    close_margin_keep_both_tier1: 0.4
+    clear_win_for_archetype: 0.8
+
+routing:
+  max_queue_wait_min: 20
+  fuse_after_failures: 3
+  fuse_cooldown_min: 30
+  route_matrix:
+    hero_cinematic:
+      - veo_3_1
+      - veo_3_1_fast
+      - runway_gen_4_5
+    narrative_multi_shot:
+      - seedance_2_0
+      - kling_3_0
+      - runway_gen_4
+    reference_storytelling:
+      - seedance_2_0
+      - vidu_q3
+      - kling_3_0
+    motion_control:
+      - kling_3_0
+      - seedance_2_0
+      - runway_gen_4
+    action_heavy:
+      - kling_3_0
+      - runway_gen_4
+      - seedance_2_0
+    dialogue_native_audio:
+      - vidu_q3
+      - seedance_2_0
+      - kling_3_0
+    reference_consistency:
+      - vidu_q3
+      - kling_3_0
+      - seedance_2_0
+    insert_cutaway:
+      - vidu_q3
+      - hailuo_current
+      - wan
+
+planning:
+  shot_specs_file: input/shot_specs.example.yaml
