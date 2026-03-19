@@ -117,6 +117,8 @@ class ExecutionSection(BaseModel):
     primary_provider: str = "kling_3_0"
     optional_provider: str = "vidu_q3"
     live_mode: bool = False
+    request_timeout_sec: int = Field(default=60, ge=1)
+    save_provider_requests: bool = True
 
 
 class ProjectSpec(BaseModel):

@@ -476,6 +476,76 @@
 - 立刻重跑 `all --dry-run`
 - 只检查最新 `run_id` 的 `candidate_clips / judge_scores / judge_report`
 
+## 2026-03-19 Round 17
+
+### 改动
+
+- 增强 `moviegen/providers.py`
+  - 为 `Kling` 和 `Vidu` 增加 `build_request()`
+  - 增加 mock/live 双模式
+  - 约定环境变量：
+    - `MOVIEGEN_KLING_SUBMIT_URL`
+    - `MOVIEGEN_KLING_TOKEN`
+    - `MOVIEGEN_VIDU_SUBMIT_URL`
+    - `MOVIEGEN_VIDU_TOKEN`
+- 为 `execution` 增加：
+  - `request_timeout_sec`
+  - `save_provider_requests`
+- 新增 `moviegen doctor`
+- `generate` 阶段新增 `provider_requests` 落盘
+
+### 效果
+
+- 当前真实 provider 默认路线已明确以 `Kling` 为主
+- `Vidu` 作为可选替换项保留
+- 即使还没打到线上 API，我们也已经能看到未来 live submit 的请求结构
+
+### 问题
+
+- 由于官方 API 细节尚未完全固化，当前 live submit 仍是保守实现
+- `request_timeout_sec` 目前还没有真正传递到 adapter 超时参数中
+
+### 下一步
+
+- 跑一轮新的 `all --dry-run`
+- 验证 `provider_requests.json`
+- 若需要，再把 `request_timeout_sec` 真正接入 adapter
+
+## 2026-03-19 Round 18
+
+### 改动
+
+- 运行 `moviegen doctor`
+- 运行新的 `all --dry-run`
+- 验证：
+  - `provider_requests.json`
+  - `generate_summary`
+  - `candidate_clips`
+  - `judge_scores`
+
+### 效果
+
+- 当前 `doctor` 已能明确显示：
+  - `Kling` 为默认主 provider
+  - `Vidu` 为默认可选替换项
+  - 相关环境变量是否就绪
+- 最新全链路 provider 验证基线：
+  - `run_20260319_152023_f9c4c04a`
+- 已确认 `generate_summary` 中包含：
+  - `provider_requests`
+  - 每个请求的 `mode / status / request / response / error`
+- 已确认 `workspace/jobs/run_20260319_152023_f9c4c04a__provider_requests.json` 成功落盘
+
+### 问题
+
+- 当前 request body 仍偏保守，只能视作“统一外发载荷草案”
+- `seedance_2_0` 暂时仍走 generic provider request 结构
+
+### 下一步
+
+- 若继续接真实平台，优先把 `Kling` 的 live submit 细化到真实字段映射
+- 若继续增强本地闭环，优先提升 `AI Judge` 的判定质量
+
 ## 2026-03-19 Round 16
 
 ### 改动

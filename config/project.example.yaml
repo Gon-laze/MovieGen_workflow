@@ -113,3 +113,5 @@ execution:
   primary_provider: kling_3_0
   optional_provider: vidu_q3
   live_mode: false
+  request_timeout_sec: 60
+  save_provider_requests: true

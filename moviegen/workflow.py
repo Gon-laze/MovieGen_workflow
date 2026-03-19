@@ -656,9 +656,21 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
 
     candidate_dir = ctx.root / "workspace" / "candidates"
     generated_candidates: list[dict[str, Any]] = []
+    provider_requests: list[dict[str, Any]] = []
     for job in routed_jobs:
         adapter = resolve_adapter(spec, job["provider"])
         adapter_result = adapter.submit(job)
+        provider_requests.append(
+            {
+                "job_id": job["job_id"],
+                "provider": job["provider"],
+                "mode": adapter_result.get("mode"),
+                "status": adapter_result.get("status"),
+                "request": adapter_result.get("request"),
+                "response": adapter_result.get("response"),
+                "error": adapter_result.get("error"),
+            }
+        )
         candidate_clip_id = f"candidate_{uuid4().hex[:12]}"
         candidate_payload = {
             "candidate_clip_id": candidate_clip_id,
@@ -707,13 +719,19 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         "run_id": ctx.run_id,
         "candidate_count": len(generated_candidates),
         "candidates": generated_candidates,
+        "provider_requests": provider_requests,
         "note": "Created mock candidate clip placeholders from generation jobs.",
         "created_at": now_iso(),
     }
     out = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__generate_summary.json"
+    requests_out = ctx.root / "workspace" / "jobs" / f"{ctx.run_id}__provider_requests.json"
     write_json(out, summary)
+    if spec.execution.save_provider_requests:
+        write_json(requests_out, provider_requests)
     ctx.record_artifact(path=out, artifact_type="report", source_stage=Stage.GENERATE.value)
-    return StageResult(note=summary["note"], artifacts=[out], metadata={"candidate_count": len(generated_candidates)})
+    if spec.execution.save_provider_requests:
+        ctx.record_artifact(path=requests_out, artifact_type="provider_request_log", source_stage=Stage.GENERATE.value, retention_policy="cache")
+    return StageResult(note=summary["note"], artifacts=[out, requests_out] if spec.execution.save_provider_requests else [out], metadata={"candidate_count": len(generated_candidates)})
 
 
 def evaluate_candidate(provider: str, archetype: str, grade: str) -> dict[str, Any]:

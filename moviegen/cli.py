@@ -290,6 +290,23 @@ def benchmark(
 
 
 @app.command()
+def doctor() -> None:
+    import os
+
+    payload = {
+        "execution_default_primary": "kling_3_0",
+        "execution_default_optional": "vidu_q3",
+        "env": {
+            "MOVIEGEN_KLING_SUBMIT_URL": bool(os.getenv("MOVIEGEN_KLING_SUBMIT_URL")),
+            "MOVIEGEN_KLING_TOKEN": bool(os.getenv("MOVIEGEN_KLING_TOKEN")),
+            "MOVIEGEN_VIDU_SUBMIT_URL": bool(os.getenv("MOVIEGEN_VIDU_SUBMIT_URL")),
+            "MOVIEGEN_VIDU_TOKEN": bool(os.getenv("MOVIEGEN_VIDU_TOKEN")),
+        },
+    }
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@app.command()
 def resume(run_id: str = typer.Option(..., "--run-id")) -> None:
     root = Path.cwd()
     conn = connect(root / "state" / "moviegen.db")
