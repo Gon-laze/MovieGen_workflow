@@ -1020,3 +1020,62 @@
 
 - 把 `review` 从 placeholder 提升为真实阶段，至少能汇总 `media_gate_warn` 候选
 - 或者把 `route_back_stage=generate/review` 真正接到 `resume` / 再执行策略里
+
+## 2026-03-19 Round 22
+
+### 改动
+
+- 把 `review` 从 placeholder 提升为真实阶段
+  - 读取 `judge_scores`
+  - 生成 `review_summary`
+  - 输出三类队列：
+    - `review_candidates`
+    - `regenerate_candidates`
+    - `approved_candidates`
+- 将 `review` 与 human gate 打通
+  - gate 名称固定为 `gate_3_review`
+  - 有 review 候选时：`status=waiting`
+  - 只有 regenerate/approved 时：`status=approved`
+  - gate payload 会写入三类 candidate ids
+- `review_summary` 现在包含：
+  - candidate 基本信息
+  - `decision / route_back_stage / hard_fail / decision_reasons / media_gate_status`
+  - 候选当前状态与媒体路径
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 正常小文件链路：
+  - run_id: `run_20260319_223709_0f28a433`
+  - 触发 `warn -> review`
+- 空文件链路：
+  - run_id: `run_20260319_223746_006af55e`
+  - 触发 `fail -> regenerate`
+- 检查：
+  - `workspace/review/run_20260319_223709_0f28a433__review_summary.json`
+  - `workspace/review/run_20260319_223746_006af55e__review_summary.json`
+  - `python -m moviegen.cli status --run-id ...` 中的 `gates`
+
+### 效果
+
+- `warn -> review queue` 已真实落地
+  - `run_20260319_223709_0f28a433` 中：
+    - `review_candidates = 3`
+    - `gate_3_review.status = waiting`
+    - `decision_summary = 3 candidates require manual review.`
+- `fail -> regenerate queue` 也已真实落地
+  - `run_20260319_223746_006af55e` 中：
+    - `regenerate_candidates = 3`
+    - `gate_3_review.status = approved`
+    - 无需人工 review，但 regenerate 队列已明确输出
+- `status --run-id` 现在能把真实 review gate 一并展示出来
+
+### 问题
+
+- `review` 目前仍是“汇总与排队”阶段，还没有真正处理人工审核动作本身
+- `resume` 还没有消费 `review_summary` 或 `gate_3_review` 去做自动再执行
+
+### 下一步
+
+- 把 `resume` / 再执行策略接到 `review_summary` 和 `route_back_stage`
+- 或者把 `gate --approve/--reject` 的结果进一步驱动后续 stage

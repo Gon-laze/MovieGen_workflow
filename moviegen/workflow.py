@@ -16,7 +16,7 @@ import yaml
 
 from .models import ORDERED_STAGES, ProjectSpec, Stage
 from .providers import TERMINAL_PROVIDER_STATES, infer_media_extension, resolve_adapter
-from .storage import insert_artifact, upsert_candidate_clip, upsert_generation_job, upsert_judge_score
+from .storage import insert_artifact, upsert_candidate_clip, upsert_generation_job, upsert_human_gate, upsert_judge_score
 
 
 def now_iso() -> str:
@@ -1670,6 +1670,126 @@ def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     return StageResult(note=summary["note"], artifacts=[out], metadata={"judge_count": len(judge_entries)})
 
 
+def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
+    judge_path = ctx.root / "workspace" / "review" / f"{ctx.run_id}__judge_scores.json"
+    if not judge_path.exists():
+        payload = {
+            "review_id": f"review_{uuid4().hex[:12]}",
+            "run_id": ctx.run_id,
+            "review_candidates": [],
+            "regenerate_candidates": [],
+            "approved_candidates": [],
+            "note": "Review stage found no judge report for this run.",
+            "created_at": now_iso(),
+        }
+        out = ctx.root / "workspace" / "review" / f"{ctx.run_id}__review_summary.json"
+        write_json(out, payload)
+        ctx.record_artifact(path=out, artifact_type="review_report", source_stage=Stage.REVIEW.value)
+        return StageResult(note=payload["note"], artifacts=[out], metadata=payload)
+
+    judge_payload = json.loads(judge_path.read_text(encoding="utf-8"))
+    judge_scores = judge_payload.get("judge_scores", [])
+
+    candidate_dir = ctx.root / "workspace" / "candidates"
+    candidate_index: dict[str, dict[str, Any]] = {}
+    for candidate_path in sorted(candidate_dir.glob(f"{ctx.run_id}__*.json")):
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        candidate_index[candidate["candidate_clip_id"]] = candidate
+
+    review_candidates: list[dict[str, Any]] = []
+    regenerate_candidates: list[dict[str, Any]] = []
+    approved_candidates: list[dict[str, Any]] = []
+
+    for entry in judge_scores:
+        candidate = candidate_index.get(entry["candidate_clip_id"], {})
+        record = {
+            "candidate_clip_id": entry["candidate_clip_id"],
+            "shot_id": entry["shot_id"],
+            "provider": entry["provider"],
+            "grade": entry.get("grade"),
+            "decision": entry.get("decision"),
+            "route_back_stage": entry.get("route_back_stage"),
+            "hard_fail": entry.get("hard_fail", False),
+            "hard_fail_reasons": entry.get("hard_fail_reasons", []),
+            "decision_reasons": entry.get("decision_reasons", []),
+            "media_gate_status": entry.get("media_gate_status"),
+            "weighted_total_score": entry.get("weighted_total_score"),
+            "candidate_status": candidate.get("status"),
+            "planned_provider": candidate.get("planned_provider"),
+            "source_type": candidate.get("source_type"),
+            "media_artifact_path": candidate.get("media_artifact_path"),
+        }
+        if entry.get("decision") == "review" or entry.get("route_back_stage") == "review":
+            review_candidates.append(record)
+        elif entry.get("decision") == "regenerate_same_provider" or entry.get("route_back_stage") == "generate":
+            regenerate_candidates.append(record)
+        else:
+            approved_candidates.append(record)
+
+    gate_status = "approved"
+    gate_summary = "No manual review queue was created."
+    if review_candidates:
+        gate_status = "waiting"
+        gate_summary = f"{len(review_candidates)} candidates require manual review."
+    gate_payload = {
+        "review_candidate_ids": [item["candidate_clip_id"] for item in review_candidates],
+        "regenerate_candidate_ids": [item["candidate_clip_id"] for item in regenerate_candidates],
+        "approved_candidate_ids": [item["candidate_clip_id"] for item in approved_candidates],
+    }
+    if spec.workflow.enable_human_gates:
+        timestamp = now_iso()
+        upsert_human_gate(
+            ctx.conn,
+            gate_id=f"{ctx.run_id}__gate_3_review",
+            run_id=ctx.run_id,
+            gate_name="gate_3_review",
+            status=gate_status,
+            reviewer=None,
+            decision_summary=gate_summary,
+            decision_payload=json.dumps(gate_payload, ensure_ascii=False),
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+
+    payload = {
+        "review_id": f"review_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "review_candidates": review_candidates,
+        "regenerate_candidates": regenerate_candidates,
+        "approved_candidates": approved_candidates,
+        "gate": {
+            "gate_name": "gate_3_review",
+            "status": gate_status,
+            "summary": gate_summary,
+            "enabled": spec.workflow.enable_human_gates,
+        },
+        "counts": {
+            "review": len(review_candidates),
+            "regenerate": len(regenerate_candidates),
+            "approved": len(approved_candidates),
+        },
+        "note": (
+            f"Prepared review queue for {len(review_candidates)} candidates and flagged {len(regenerate_candidates)} for regenerate."
+            if review_candidates or regenerate_candidates
+            else "No manual review or regenerate actions were needed for this run."
+        ),
+        "created_at": now_iso(),
+    }
+    out = ctx.root / "workspace" / "review" / f"{ctx.run_id}__review_summary.json"
+    write_json(out, payload)
+    ctx.record_artifact(path=out, artifact_type="review_report", source_stage=Stage.REVIEW.value)
+    return StageResult(
+        note=payload["note"],
+        artifacts=[out],
+        metadata={
+            "review_count": len(review_candidates),
+            "regenerate_count": len(regenerate_candidates),
+            "approved_count": len(approved_candidates),
+            "gate_status": gate_status,
+        },
+    )
+
+
 STAGE_HANDLERS = {
     Stage.INGEST: stage_ingest,
     Stage.ANALYZE: stage_analyze,
@@ -1680,6 +1800,7 @@ STAGE_HANDLERS = {
     Stage.ROUTE: stage_route,
     Stage.GENERATE: stage_generate,
     Stage.JUDGE: stage_judge,
+    Stage.REVIEW: stage_review,
 }
 
 
