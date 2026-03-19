@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -149,86 +150,119 @@ def execute_run(
     )
 
     ctx = RunContext(root=root, run_id=current_run_id, conn=conn)
-    for current_stage in stages:
-        stage_started = now_iso()
-        result = execute_stage(ctx, spec, current_stage, project_file)
-        note = f"{result.note} (dry-run)" if dry_run else result.note
-        finished_stage = now_iso()
-        insert_stage_run(
+    current_stage: Stage | None = None
+    try:
+        for current_stage in stages:
+            stage_started = now_iso()
+            result = execute_stage(ctx, spec, current_stage, project_file)
+            note = f"{result.note} (dry-run)" if dry_run else result.note
+            finished_stage = now_iso()
+            insert_stage_run(
+                conn,
+                run_id=current_run_id,
+                stage_name=current_stage.value,
+                status="succeeded",
+                notes=note,
+                started_at=stage_started,
+                finished_at=finished_stage,
+            )
+            append_jsonl(
+                root / "workspace" / "logs" / "stages" / f"{current_run_id}__{current_stage.value}.jsonl",
+                {
+                    "timestamp": stage_started,
+                    "run_id": current_run_id,
+                    "stage_name": current_stage.value,
+                    "shot_id": None,
+                    "job_id": None,
+                    "provider": None,
+                    "level": "INFO",
+                    "event_type": "stage_completed",
+                    "message": note,
+                    "error_code": None,
+                    "metadata": result.metadata,
+                },
+            )
+
+        summary = build_summary(spec, current_run_id, stages, dry_run)
+        summary_path, status_path = write_run_artifacts(root, current_run_id, summary)
+        finished_at = now_iso()
+        complete_run(conn, current_run_id, "completed", run_note, finished_at)
+
+        insert_artifact(
             conn,
+            artifact_id=f"artifact_{uuid4().hex[:12]}",
             run_id=current_run_id,
-            stage_name=current_stage.value,
-            status="succeeded",
-            notes=note,
-            started_at=stage_started,
-            finished_at=finished_stage,
+            artifact_type="report",
+            artifact_path=str(summary_path),
+            source_stage="report",
+            source_id=current_run_id,
+            content_hash=sha256_file(summary_path),
+            file_size_bytes=summary_path.stat().st_size,
+            retention_policy="keep",
+            created_at=finished_at,
         )
+        insert_artifact(
+            conn,
+            artifact_id=f"artifact_{uuid4().hex[:12]}",
+            run_id=current_run_id,
+            artifact_type="report",
+            artifact_path=str(status_path),
+            source_stage="report",
+            source_id=current_run_id,
+            content_hash=sha256_file(status_path),
+            file_size_bytes=status_path.stat().st_size,
+            retention_policy="keep",
+            created_at=finished_at,
+        )
+
         append_jsonl(
-            root / "workspace" / "logs" / "stages" / f"{current_run_id}__{current_stage.value}.jsonl",
+            run_log,
             {
-                "timestamp": stage_started,
+                "timestamp": finished_at,
                 "run_id": current_run_id,
-                "stage_name": current_stage.value,
+                "stage_name": None,
                 "shot_id": None,
                 "job_id": None,
                 "provider": None,
                 "level": "INFO",
-                "event_type": "stage_completed",
-                "message": note,
+                "event_type": "run_completed",
+                "message": "Run completed",
                 "error_code": None,
-                "metadata": result.metadata,
+                "metadata": {"summary_path": str(summary_path)},
             },
         )
-
-    summary = build_summary(spec, current_run_id, stages, dry_run)
-    summary_path, status_path = write_run_artifacts(root, current_run_id, summary)
-    finished_at = now_iso()
-    complete_run(conn, current_run_id, "completed", run_note, finished_at)
-
-    insert_artifact(
-        conn,
-        artifact_id=f"artifact_{uuid4().hex[:12]}",
-        run_id=current_run_id,
-        artifact_type="report",
-        artifact_path=str(summary_path),
-        source_stage="report",
-        source_id=current_run_id,
-        content_hash=sha256_file(summary_path),
-        file_size_bytes=summary_path.stat().st_size,
-        retention_policy="keep",
-        created_at=finished_at,
-    )
-    insert_artifact(
-        conn,
-        artifact_id=f"artifact_{uuid4().hex[:12]}",
-        run_id=current_run_id,
-        artifact_type="report",
-        artifact_path=str(status_path),
-        source_stage="report",
-        source_id=current_run_id,
-        content_hash=sha256_file(status_path),
-        file_size_bytes=status_path.stat().st_size,
-        retention_policy="keep",
-        created_at=finished_at,
-    )
-
-    append_jsonl(
-        run_log,
-        {
-            "timestamp": finished_at,
-            "run_id": current_run_id,
-            "stage_name": None,
-            "shot_id": None,
-            "job_id": None,
-            "provider": None,
-            "level": "INFO",
-            "event_type": "run_completed",
-            "message": "Run completed",
-            "error_code": None,
-            "metadata": {"summary_path": str(summary_path)},
-        },
-    )
-    return {"run_id": current_run_id, "status": "completed", "summary_path": str(summary_path)}
+        return {"run_id": current_run_id, "status": "completed", "summary_path": str(summary_path)}
+    except Exception as exc:
+        failed_at = now_iso()
+        stage_name = current_stage.value if current_stage else "unknown"
+        error_text = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        insert_stage_run(
+            conn,
+            run_id=current_run_id,
+            stage_name=stage_name,
+            status="failed",
+            notes=error_text,
+            started_at=failed_at,
+            finished_at=failed_at,
+        )
+        complete_run(conn, current_run_id, "failed", error_text, failed_at)
+        append_jsonl(
+            run_log,
+            {
+                "timestamp": failed_at,
+                "run_id": current_run_id,
+                "stage_name": stage_name,
+                "shot_id": None,
+                "job_id": None,
+                "provider": None,
+                "level": "ERROR",
+                "event_type": "run_failed",
+                "message": error_text,
+                "error_code": "MG_SYSTEM_001",
+                "metadata": {},
+            },
+        )
+        raise
 
 
 @app.command()

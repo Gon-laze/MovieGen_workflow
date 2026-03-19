@@ -12,7 +12,8 @@ from uuid import uuid4
 import yaml
 
 from .models import ORDERED_STAGES, ProjectSpec, Stage
-from .storage import insert_artifact, upsert_generation_job
+from .providers import resolve_adapter
+from .storage import insert_artifact, upsert_candidate_clip, upsert_generation_job, upsert_judge_score
 
 
 def now_iso() -> str:
@@ -647,6 +648,196 @@ def stage_noop(ctx: RunContext, spec: ProjectSpec, stage: Stage) -> StageResult:
     return StageResult(note=payload["note"], artifacts=[out], metadata=payload)
 
 
+def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
+    jobs_path = ctx.root / "workspace" / "jobs" / f"{ctx.run_id}__generation_jobs.json"
+    routed_jobs: list[dict[str, Any]] = []
+    if jobs_path.exists():
+        routed_jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
+
+    candidate_dir = ctx.root / "workspace" / "candidates"
+    generated_candidates: list[dict[str, Any]] = []
+    for job in routed_jobs:
+        adapter = resolve_adapter(spec, job["provider"])
+        adapter_result = adapter.submit(job)
+        candidate_clip_id = f"candidate_{uuid4().hex[:12]}"
+        candidate_payload = {
+            "candidate_clip_id": candidate_clip_id,
+            "job_id": job["job_id"],
+            "shot_id": job["shot_id"],
+            "provider": job["provider"],
+            "provider_model": job["provider_model"],
+            "duration_sec": 0.0,
+            "resolution": "unknown",
+            "has_native_audio": False,
+            "source_type": "planned_generation",
+            "status": "ready",
+            "adapter_result": adapter_result,
+            "created_at": now_iso(),
+        }
+        candidate_path = candidate_dir / f"{job['shot_id']}__{job['provider']}__{candidate_clip_id}.json"
+        write_json(candidate_path, candidate_payload)
+        artifact_hash = sha256_file(candidate_path)
+        upsert_candidate_clip(
+            ctx.conn,
+            candidate_clip_id=candidate_clip_id,
+            job_id=job["job_id"],
+            shot_id=job["shot_id"],
+            provider=job["provider"],
+            provider_model=job["provider_model"],
+            artifact_path=str(candidate_path),
+            duration_sec=0.0,
+            resolution="unknown",
+            has_native_audio=False,
+            source_type="planned_generation",
+            artifact_hash=artifact_hash,
+            status="ready",
+            created_at=now_iso(),
+        )
+        ctx.record_artifact(
+            path=candidate_path,
+            artifact_type="candidate_clip",
+            source_stage=Stage.GENERATE.value,
+            source_id=candidate_clip_id,
+            retention_policy="cache",
+        )
+        generated_candidates.append(candidate_payload)
+
+    summary = {
+        "generate_id": f"generate_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "candidate_count": len(generated_candidates),
+        "candidates": generated_candidates,
+        "note": "Created mock candidate clip placeholders from generation jobs.",
+        "created_at": now_iso(),
+    }
+    out = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__generate_summary.json"
+    write_json(out, summary)
+    ctx.record_artifact(path=out, artifact_type="report", source_stage=Stage.GENERATE.value)
+    return StageResult(note=summary["note"], artifacts=[out], metadata={"candidate_count": len(generated_candidates)})
+
+
+def evaluate_candidate(provider: str, archetype: str, grade: str) -> dict[str, Any]:
+    base = {
+        "identity_consistency": 7.4,
+        "scene_consistency": 7.2,
+        "instruction_fidelity": 7.3,
+        "motion_stability": 7.1,
+        "camera_language": 7.0,
+        "image_quality": 7.5,
+        "audio_sync": None,
+        "narrative_utility": 7.2,
+        "artifact_penalty": 0.0,
+    }
+    if provider == "seedance_2_0" and archetype == "narrative_multi_shot":
+        base.update({"scene_consistency": 8.6, "instruction_fidelity": 8.5, "narrative_utility": 8.8, "motion_stability": 8.1})
+    elif provider == "kling_3_0" and archetype == "motion_control":
+        base.update({"identity_consistency": 8.4, "motion_stability": 8.8, "camera_language": 8.2})
+    elif provider == "vidu_q3" and archetype == "dialogue_native_audio":
+        base.update({"audio_sync": 8.5, "narrative_utility": 8.0, "instruction_fidelity": 7.9})
+    elif provider == "seedance_2_0" and archetype == "dialogue_native_audio":
+        base.update({"audio_sync": 7.8, "narrative_utility": 7.8})
+    elif provider == "kling_3_0" and archetype == "narrative_multi_shot":
+        base.update({"scene_consistency": 8.0, "motion_stability": 8.2, "narrative_utility": 8.0})
+
+    weights = {
+        "identity_consistency": 0.18,
+        "scene_consistency": 0.14,
+        "instruction_fidelity": 0.14,
+        "motion_stability": 0.14,
+        "camera_language": 0.10,
+        "image_quality": 0.12,
+        "audio_sync": 0.08,
+        "narrative_utility": 0.10,
+    }
+    values = {k: v for k, v in base.items() if k in weights and v is not None}
+    effective_total = sum(weights[k] for k in values)
+    weighted = sum(values[k] * weights[k] for k in values) / effective_total
+    weighted -= float(base["artifact_penalty"])
+
+    if grade == "A":
+        pass_threshold, review_threshold = 8.4, 7.8
+    elif grade == "B":
+        pass_threshold, review_threshold = 7.8, 7.2
+    else:
+        pass_threshold, review_threshold = 7.0, 6.5
+
+    if weighted >= pass_threshold:
+        decision = "pass"
+        route_back_stage = None
+    elif weighted >= review_threshold:
+        decision = "review"
+        route_back_stage = None
+    else:
+        decision = "regenerate_same_provider"
+        route_back_stage = "generate"
+
+    return {
+        "metrics": base,
+        "weighted_total_score": round(weighted, 3),
+        "decision": decision,
+        "route_back_stage": route_back_stage,
+        "hard_fail": False,
+        "hard_fail_reasons": [],
+    }
+
+
+def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
+    jobs_path = ctx.root / "workspace" / "jobs" / f"{ctx.run_id}__generation_jobs.json"
+    routed_jobs: list[dict[str, Any]] = []
+    if jobs_path.exists():
+        routed_jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
+    job_index = {job["job_id"]: job for job in routed_jobs}
+
+    candidate_dir = ctx.root / "workspace" / "candidates"
+    candidates = sorted(candidate_dir.glob("*.json"))
+    judge_entries: list[dict[str, Any]] = []
+    for candidate_path in candidates:
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        job = job_index.get(candidate["job_id"], {})
+        evaluation = evaluate_candidate(candidate["provider"], job.get("archetype", "insert_cutaway"), job.get("grade", "B"))
+        judge_score_id = f"judge_{uuid4().hex[:12]}"
+        entry = {
+            "judge_score_id": judge_score_id,
+            "candidate_clip_id": candidate["candidate_clip_id"],
+            "shot_id": candidate["shot_id"],
+            "provider": candidate["provider"],
+            "grade": job.get("grade", "B"),
+            **evaluation,
+            "judge_model": "heuristic_judge_v0",
+            "judge_prompt_version": "v0",
+            "created_at": now_iso(),
+        }
+        judge_entries.append(entry)
+        upsert_judge_score(
+            ctx.conn,
+            judge_score_id=judge_score_id,
+            candidate_clip_id=entry["candidate_clip_id"],
+            shot_id=entry["shot_id"],
+            provider=entry["provider"],
+            grade=entry["grade"],
+            weighted_total_score=entry["weighted_total_score"],
+            decision=entry["decision"],
+            hard_fail=entry["hard_fail"],
+            hard_fail_reasons=json.dumps(entry["hard_fail_reasons"], ensure_ascii=False),
+            route_back_stage=entry["route_back_stage"],
+            judge_model=entry["judge_model"],
+            judge_prompt_version=entry["judge_prompt_version"],
+            created_at=entry["created_at"],
+        )
+
+    summary = {
+        "judge_id": f"judge_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "judge_scores": judge_entries,
+        "note": "Computed heuristic judge scores for generated candidate placeholders.",
+        "created_at": now_iso(),
+    }
+    out = ctx.root / "workspace" / "review" / f"{ctx.run_id}__judge_scores.json"
+    write_json(out, summary)
+    ctx.record_artifact(path=out, artifact_type="judge_report", source_stage=Stage.JUDGE.value)
+    return StageResult(note=summary["note"], artifacts=[out], metadata={"judge_count": len(judge_entries)})
+
+
 STAGE_HANDLERS = {
     Stage.INGEST: stage_ingest,
     Stage.ANALYZE: stage_analyze,
@@ -655,6 +846,8 @@ STAGE_HANDLERS = {
     Stage.PLAN: stage_plan,
     Stage.COMPILE_PROMPTS: stage_compile_prompts,
     Stage.ROUTE: stage_route,
+    Stage.GENERATE: stage_generate,
+    Stage.JUDGE: stage_judge,
 }
 
 

@@ -116,6 +116,21 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "generation_jobs", "estimated_cost_usd", "REAL")
     _ensure_column(conn, "generation_jobs", "queue_policy", "TEXT")
     _ensure_column(conn, "generation_jobs", "fallback_chain", "TEXT")
+    _ensure_column(conn, "candidate_clips", "provider_model", "TEXT")
+    _ensure_column(conn, "candidate_clips", "duration_sec", "REAL")
+    _ensure_column(conn, "candidate_clips", "resolution", "TEXT")
+    _ensure_column(conn, "candidate_clips", "has_native_audio", "INTEGER")
+    _ensure_column(conn, "candidate_clips", "source_type", "TEXT")
+    _ensure_column(conn, "candidate_clips", "artifact_hash", "TEXT")
+    _ensure_column(conn, "candidate_clips", "status", "TEXT")
+    _ensure_column(conn, "judge_scores", "shot_id", "TEXT")
+    _ensure_column(conn, "judge_scores", "provider", "TEXT")
+    _ensure_column(conn, "judge_scores", "grade", "TEXT")
+    _ensure_column(conn, "judge_scores", "hard_fail", "INTEGER")
+    _ensure_column(conn, "judge_scores", "hard_fail_reasons", "TEXT")
+    _ensure_column(conn, "judge_scores", "route_back_stage", "TEXT")
+    _ensure_column(conn, "judge_scores", "judge_model", "TEXT")
+    _ensure_column(conn, "judge_scores", "judge_prompt_version", "TEXT")
     conn.commit()
 
 
@@ -351,6 +366,100 @@ def upsert_generation_job(
             external_job_id,
             created_at,
             updated_at,
+        ),
+    )
+    conn.commit()
+
+
+def upsert_candidate_clip(
+    conn: sqlite3.Connection,
+    *,
+    candidate_clip_id: str,
+    job_id: str,
+    shot_id: str,
+    provider: str,
+    provider_model: str,
+    artifact_path: str,
+    duration_sec: float,
+    resolution: str,
+    has_native_audio: bool,
+    source_type: str,
+    artifact_hash: str,
+    status: str,
+    created_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO candidate_clips
+        (candidate_clip_id, job_id, shot_id, provider, provider_model, artifact_path, duration_sec, resolution, has_native_audio, source_type, artifact_hash, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(candidate_clip_id) DO UPDATE SET
+            artifact_path = excluded.artifact_path,
+            artifact_hash = excluded.artifact_hash,
+            status = excluded.status
+        """,
+        (
+            candidate_clip_id,
+            job_id,
+            shot_id,
+            provider,
+            provider_model,
+            artifact_path,
+            duration_sec,
+            resolution,
+            int(has_native_audio),
+            source_type,
+            artifact_hash,
+            status,
+            created_at,
+        ),
+    )
+    conn.commit()
+
+
+def upsert_judge_score(
+    conn: sqlite3.Connection,
+    *,
+    judge_score_id: str,
+    candidate_clip_id: str,
+    shot_id: str,
+    provider: str,
+    grade: str,
+    weighted_total_score: float,
+    decision: str,
+    hard_fail: bool,
+    hard_fail_reasons: str,
+    route_back_stage: str | None,
+    judge_model: str,
+    judge_prompt_version: str,
+    created_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO judge_scores
+        (judge_score_id, candidate_clip_id, shot_id, provider, grade, weighted_total_score, decision, hard_fail, hard_fail_reasons, route_back_stage, judge_model, judge_prompt_version, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(judge_score_id) DO UPDATE SET
+            weighted_total_score = excluded.weighted_total_score,
+            decision = excluded.decision,
+            hard_fail = excluded.hard_fail,
+            hard_fail_reasons = excluded.hard_fail_reasons,
+            route_back_stage = excluded.route_back_stage
+        """,
+        (
+            judge_score_id,
+            candidate_clip_id,
+            shot_id,
+            provider,
+            grade,
+            weighted_total_score,
+            decision,
+            int(hard_fail),
+            hard_fail_reasons,
+            route_back_stage,
+            judge_model,
+            judge_prompt_version,
+            created_at,
         ),
     )
     conn.commit()

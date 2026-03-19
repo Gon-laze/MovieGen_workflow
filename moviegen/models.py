@@ -113,6 +113,12 @@ class PlanningSection(BaseModel):
     shot_specs_file: str | None = None
 
 
+class ExecutionSection(BaseModel):
+    primary_provider: str = "kling_3_0"
+    optional_provider: str = "vidu_q3"
+    live_mode: bool = False
+
+
 class ProjectSpec(BaseModel):
     project: ProjectSection
     references: ReferencesSection
@@ -122,6 +128,7 @@ class ProjectSpec(BaseModel):
     benchmark: BenchmarkSection
     routing: RoutingSection
     planning: PlanningSection = Field(default_factory=PlanningSection)
+    execution: ExecutionSection = Field(default_factory=ExecutionSection)
 
 
 RunStatus = Literal["created", "running", "paused_for_gate", "failed", "completed", "canceled"]

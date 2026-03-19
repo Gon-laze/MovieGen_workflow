@@ -451,3 +451,91 @@
 
 - 优先补 `AI Judge` 最小实现
 - 然后再考虑接入真实 `Kling` provider
+
+## 2026-03-19 Round 14
+
+### 改动
+
+- 定位到 `spec.execution` 缺失的根因
+- 为 `moviegen/models.py` 补回 `ExecutionSection`
+- 为 `config/project.example.yaml` 补回 `execution` 配置块
+
+### 效果
+
+- `providers.py` 不再依赖不存在的字段
+- 真实 provider 默认策略重新与配置层对齐：
+  - primary: `kling_3_0`
+  - optional: `vidu_q3`
+
+### 问题
+
+- 需要重新跑一轮最新 `all --dry-run` 才能确认 `generate/judge` 新闭环真正生效
+
+### 下一步
+
+- 立刻重跑 `all --dry-run`
+- 只检查最新 `run_id` 的 `candidate_clips / judge_scores / judge_report`
+
+## 2026-03-19 Round 15
+
+### 改动
+
+- 新增 `moviegen/providers.py`
+  - 默认主 provider 路线为 `Kling`
+  - `Vidu` 保留为可选替换项
+- 实现最小版 `generate`
+  - 从 `generation_jobs` 生成 mock `CandidateClip`
+  - 写入 `candidate_clips`
+- 实现最小版 `judge`
+  - 按 `provider + archetype + grade` 生成启发式 `JudgeScore`
+  - 写入 `judge_scores`
+- 为 `execute_run()` 增加异常收口逻辑
+- 修复历史遗留 `running` run，回填为 `failed`
+
+### 效果
+
+- 最新全链路基线 `run_id`：
+  - `run_20260319_150534_2ca394ea`
+- 已确认最小闭环贯通：
+  - `shot_specs`
+  - `prompt_packets`
+  - `generation_jobs`
+  - `candidate_clips`
+  - `judge_scores`
+- `status` 列表中的历史脏 `running` 记录已修正为 `failed`
+
+### 问题
+
+- `generate` 仍为 mock，不会提交真实 provider
+- `judge` 仍是启发式，不是多模态评分模型
+- `provider_model` 与真实模型版本字符串仍未拆分
+- `estimated_cost_usd` 仍未接入真实定价映射
+
+### 下一步
+
+- 若继续本地闭环，优先增强 `AI Judge`
+- 若开始接真实平台，优先接 `Kling` 只写适配器，再保留 `Vidu` 为可选替换项
+
+## 2026-03-19 Round 15
+
+### 改动
+
+- 为 `execute_run()` 增加异常收口逻辑
+- 发生异常时：
+  - 写入失败的 `stage_run`
+  - 将 `runs.status` 改为 `failed`
+  - 写入 `run_failed` 日志事件
+
+### 效果
+
+- 后续再出现异常时，不会再留下长期卡在 `running` 的脏 run
+- 状态面板会更可信，恢复与排障也更清晰
+
+### 问题
+
+- 历史上已经留下的 `running` 脏 run 还需要人工修正一次
+
+### 下一步
+
+- 修正历史遗留的 `running` 记录
+- 再跑一轮 `all --dry-run`，确认新的异常收口逻辑不影响正常成功路径
