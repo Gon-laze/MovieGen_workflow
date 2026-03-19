@@ -225,6 +225,7 @@ def persist_candidate_record(
     poll_result: dict[str, Any] | None = None,
     download_result: dict[str, Any] | None = None,
     media_probe: dict[str, Any] | None = None,
+    media_gate: dict[str, Any] | None = None,
     record_artifact: bool = True,
 ) -> dict[str, Any]:
     candidate_clip_id = candidate_clip_id or f"candidate_{uuid4().hex[:12]}"
@@ -247,6 +248,7 @@ def persist_candidate_record(
         "poll_result": poll_result,
         "download_result": download_result,
         "media_probe": media_probe,
+        "media_gate": media_gate,
         "media_artifact_path": media_artifact_path,
         "created_at": now_iso(),
     }
@@ -443,6 +445,47 @@ def probe_media_file(path: Path) -> dict[str, Any]:
         probe["ffprobe_status"] = "ffprobe_exception"
         probe["ffprobe_error"] = str(exc)
         return probe
+
+
+def evaluate_media_gate(media_probe: dict[str, Any]) -> dict[str, Any]:
+    reasons: list[str] = []
+    warnings: list[str] = []
+    status = "pass"
+    judge_eligible = True
+
+    if not media_probe.get("exists"):
+        reasons.append("missing_media_file")
+    if int(media_probe.get("file_size_bytes") or 0) <= 0:
+        reasons.append("empty_media_file")
+
+    ffprobe_status = media_probe.get("ffprobe_status")
+    if ffprobe_status in {"ffprobe_failed", "ffprobe_exception", "missing_file"}:
+        reasons.append(f"probe_error:{ffprobe_status}")
+    elif ffprobe_status == "ffprobe_unavailable":
+        warnings.append("ffprobe_unavailable")
+
+    if media_probe.get("ffprobe_status") == "ok":
+        if int(media_probe.get("stream_count") or 0) <= 0:
+            reasons.append("no_streams_detected")
+        if not media_probe.get("codec_name"):
+            warnings.append("codec_unknown")
+
+    if int(media_probe.get("file_size_bytes") or 0) < 1024:
+        warnings.append("tiny_media_file")
+
+    if reasons:
+        status = "fail"
+        judge_eligible = False
+    elif warnings:
+        status = "warn"
+
+    return {
+        "status": status,
+        "judge_eligible": judge_eligible,
+        "reasons": reasons,
+        "warnings": warnings,
+        "created_at": now_iso(),
+    }
 
 
 def build_live_submission_attempts(spec: ProjectSpec, shot_jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1021,6 +1064,7 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
 
     generated_candidates: list[dict[str, Any]] = []
     provider_requests: list[dict[str, Any]] = []
+    attempt_summaries: list[dict[str, Any]] = []
     jobs_by_shot: dict[str, list[dict[str, Any]]] = {}
     for job in routed_jobs:
         jobs_by_shot.setdefault(job["shot_id"], []).append(job)
@@ -1078,11 +1122,34 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             attempts = build_live_submission_attempts(spec, shot_jobs)
             attempted_job_ids: set[str] = set()
             success = False
+            last_attempt_context: dict[str, Any] | None = None
+            shot_summary = {
+                "shot_id": shot_id,
+                "planned_provider_chain": [job["provider"] for job in shot_jobs],
+                "attempt_count": 0,
+                "attempted_providers": [],
+                "fallback_used": False,
+                "fallback_trigger_reason": None,
+                "final_provider": None,
+                "final_status": "not_started",
+                "candidate_clip_id": None,
+                "judge_ready": False,
+                "media_gate_status": None,
+                "attempts": [],
+            }
             for attempt_index, attempt in enumerate(attempts, start=1):
                 job = attempt["job"]
                 submit_provider = attempt["submit_provider"]
                 remapped_from_provider = attempt["remapped_from_provider"]
+                fallback_trigger_reason = None
+                if attempt_index > 1 and last_attempt_context is not None:
+                    fallback_trigger_reason = f"{last_attempt_context['provider']}:{last_attempt_context['status']}"
+                    shot_summary["fallback_used"] = True
+                    if shot_summary["fallback_trigger_reason"] is None:
+                        shot_summary["fallback_trigger_reason"] = fallback_trigger_reason
                 attempted_job_ids.add(job["job_id"])
+                shot_summary["attempt_count"] = attempt_index
+                shot_summary["attempted_providers"].append(submit_provider)
                 packet = select_submit_packet(job, submit_provider, packet_index, packet_index_by_shot_provider)
                 submit_payload = dict(job)
                 if packet:
@@ -1111,10 +1178,26 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                             "planned_provider": job["provider"],
                             "remapped_from_provider": remapped_from_provider,
                             "attempt_reason": attempt["attempt_reason"],
+                            "fallback_trigger_reason": fallback_trigger_reason,
                         }
                     )
                 provider_requests.extend(submit_events)
+                attempt_summary = {
+                    "attempt_index": attempt_index,
+                    "planned_provider": job["provider"],
+                    "submit_provider": submit_provider,
+                    "attempt_reason": attempt["attempt_reason"],
+                    "fallback_trigger_reason": fallback_trigger_reason,
+                    "submit_status": adapter_result.get("status"),
+                    "poll_status": None,
+                    "download_status": None,
+                    "final_candidate_status": None,
+                    "media_gate_status": None,
+                }
+                shot_summary["attempts"].append(attempt_summary)
                 if adapter_result.get("status") in LIVE_SUBMIT_SUCCESS_STATUSES:
+                    shot_summary["final_provider"] = submit_provider
+                    shot_summary["final_status"] = adapter_result.get("status")
                     candidate_payload = persist_candidate_record(
                         ctx,
                         job=job,
@@ -1129,9 +1212,11 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                     external_job_id = adapter_result.get("external_job_id")
                     if spec.execution.poll_after_submit and external_job_id:
                         poll_result, poll_events = poll_until_terminal(adapter, external_job_id, spec)
+                        attempt_summary["poll_status"] = poll_result.get("status")
                         for event in poll_events:
                             event["shot_id"] = shot_id
                             event["job_id"] = job["job_id"]
+                            event["fallback_trigger_reason"] = fallback_trigger_reason
                         provider_requests.extend(poll_events)
                         if poll_result.get("status") == "completed":
                             asset_url = poll_result.get("asset_url")
@@ -1153,9 +1238,11 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                         "external_job_id": external_job_id,
                                         "mode": download_result.get("mode"),
                                         "request": {"download_url": asset_url, "media_path": str(media_path)},
+                                        "fallback_trigger_reason": fallback_trigger_reason,
                                     }
                                 )
                             provider_requests.extend(download_events)
+                            attempt_summary["download_status"] = download_result.get("status")
                             if download_result.get("status") == "downloaded":
                                 sync_generation_job_state(
                                     ctx,
@@ -1166,11 +1253,21 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                     actual_provider_model=(packet or {}).get("provider_model", submit_provider),
                                 )
                                 media_probe = probe_media_file(media_path)
+                                media_gate = evaluate_media_gate(media_probe)
                                 probe_path = media_path.with_suffix(f"{media_path.suffix}.probe.json")
+                                gate_path = media_path.with_suffix(f"{media_path.suffix}.gate.json")
                                 write_json(probe_path, media_probe)
+                                write_json(gate_path, media_gate)
                                 ctx.record_artifact(
                                     path=media_path,
                                     artifact_type="candidate_media",
+                                    source_stage=Stage.GENERATE.value,
+                                    source_id=candidate_payload["candidate_clip_id"],
+                                    retention_policy="cache",
+                                )
+                                ctx.record_artifact(
+                                    path=gate_path,
+                                    artifact_type="candidate_media_gate",
                                     source_stage=Stage.GENERATE.value,
                                     source_id=candidate_payload["candidate_clip_id"],
                                     retention_policy="cache",
@@ -1189,16 +1286,23 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                     submit_provider=submit_provider,
                                     planned_provider=job["provider"],
                                     adapter_result=adapter_result,
-                                    status="ready_for_judge",
+                                    status="ready_for_judge" if media_gate["judge_eligible"] else "media_gate_failed",
                                     source_type="downloaded_candidate",
                                     candidate_clip_id=candidate_payload["candidate_clip_id"],
                                     media_artifact_path=str(media_path),
                                     poll_result=poll_result,
                                     download_result=download_result,
                                     media_probe=media_probe,
+                                    media_gate=media_gate,
                                     record_artifact=False,
                                 )
                                 generated_candidates[-1] = candidate_payload
+                                shot_summary["candidate_clip_id"] = candidate_payload["candidate_clip_id"]
+                                shot_summary["judge_ready"] = bool(media_gate["judge_eligible"])
+                                shot_summary["media_gate_status"] = media_gate["status"]
+                                shot_summary["final_status"] = candidate_payload["status"]
+                                attempt_summary["final_candidate_status"] = candidate_payload["status"]
+                                attempt_summary["media_gate_status"] = media_gate["status"]
                             else:
                                 sync_generation_job_state(
                                     ctx,
@@ -1223,6 +1327,9 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                     record_artifact=False,
                                 )
                                 generated_candidates[-1] = candidate_payload
+                                shot_summary["candidate_clip_id"] = candidate_payload["candidate_clip_id"]
+                                shot_summary["final_status"] = candidate_payload["status"]
+                                attempt_summary["final_candidate_status"] = candidate_payload["status"]
                         elif poll_result.get("status") == "failed":
                             sync_generation_job_state(
                                 ctx,
@@ -1246,6 +1353,9 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                 record_artifact=False,
                             )
                             generated_candidates[-1] = candidate_payload
+                            shot_summary["candidate_clip_id"] = candidate_payload["candidate_clip_id"]
+                            shot_summary["final_status"] = candidate_payload["status"]
+                            attempt_summary["final_candidate_status"] = candidate_payload["status"]
                         elif poll_result.get("status") == "processing":
                             sync_generation_job_state(
                                 ctx,
@@ -1255,6 +1365,9 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                 actual_provider=submit_provider,
                                 actual_provider_model=(packet or {}).get("provider_model", submit_provider),
                             )
+                            shot_summary["candidate_clip_id"] = candidate_payload["candidate_clip_id"]
+                            shot_summary["final_status"] = "processing"
+                            attempt_summary["final_candidate_status"] = "processing"
                         elif poll_result.get("status") not in {"processing", "unknown"}:
                             sync_generation_job_state(
                                 ctx,
@@ -1278,13 +1391,23 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                                 record_artifact=False,
                             )
                             generated_candidates[-1] = candidate_payload
+                            shot_summary["candidate_clip_id"] = candidate_payload["candidate_clip_id"]
+                            shot_summary["final_status"] = candidate_payload["status"]
+                            attempt_summary["final_candidate_status"] = candidate_payload["status"]
+                    else:
+                        shot_summary["candidate_clip_id"] = candidate_payload["candidate_clip_id"]
+                        shot_summary["final_status"] = candidate_payload["status"]
+                        attempt_summary["final_candidate_status"] = candidate_payload["status"]
                     success = True
                     break
+                last_attempt_context = {"provider": submit_provider, "status": adapter_result.get("status")}
+                shot_summary["final_status"] = adapter_result.get("status") or "request_failed"
             for job in shot_jobs:
                 if job["job_id"] in attempted_job_ids:
                     continue
                 residual_status = "not_attempted_after_success" if success else "suppressed_by_strategy"
                 sync_generation_job_state(ctx, job, status=residual_status, external_job_id=None)
+            attempt_summaries.append(shot_summary)
 
     status_counts: dict[str, int] = {}
     for entry in provider_requests:
@@ -1292,19 +1415,32 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         status_counts[key] = status_counts.get(key, 0) + 1
     ready_candidate_count = sum(1 for candidate in generated_candidates if candidate.get("status") in JUDGE_READY_CANDIDATE_STATUSES)
     submitted_receipt_count = sum(1 for candidate in generated_candidates if candidate.get("status") == "submitted")
+    gated_out_candidate_count = sum(1 for candidate in generated_candidates if candidate.get("status") == "media_gate_failed")
+    media_gate_status_counts: dict[str, int] = {}
+    for candidate in generated_candidates:
+        media_gate = candidate.get("media_gate")
+        if not isinstance(media_gate, dict):
+            continue
+        key = str(media_gate.get("status") or "unknown")
+        media_gate_status_counts[key] = media_gate_status_counts.get(key, 0) + 1
     summary = {
         "generate_id": f"generate_{uuid4().hex[:12]}",
         "run_id": ctx.run_id,
         "candidate_count": len(generated_candidates),
         "ready_candidate_count": ready_candidate_count,
         "submitted_receipt_count": submitted_receipt_count,
+        "gated_out_candidate_count": gated_out_candidate_count,
         "candidates": generated_candidates,
+        "attempt_summaries": attempt_summaries,
         "provider_requests": provider_requests,
         "provider_request_status_counts": status_counts,
+        "media_gate_status_counts": media_gate_status_counts,
         "note": (
             (
                 "Submitted live provider requests, polled results, and materialized judge-ready candidate media."
                 if ready_candidate_count
+                else "Submitted live provider requests and downloaded media, but all candidates were gated out before judge."
+                if gated_out_candidate_count
                 else "Submitted live provider requests and recorded provider submission receipts."
                 if generated_candidates
                 else "Attempted live provider submission, but no provider submission receipts were created."
@@ -1329,6 +1465,7 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             "candidate_count": len(generated_candidates),
             "ready_candidate_count": ready_candidate_count,
             "submitted_receipt_count": submitted_receipt_count,
+            "gated_out_candidate_count": gated_out_candidate_count,
         },
     )
 

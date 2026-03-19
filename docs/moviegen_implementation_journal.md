@@ -892,3 +892,67 @@
 - 给下载后的 candidate 增加基础 `media_gate`
   - 例如大小异常、探测失败、无视频流时自动标记为 review/regenerate
 - 再决定是否把 `post` 从 placeholder 提升为真实后处理入口
+
+## 2026-03-19 Round 20
+
+### 改动
+
+- 为 live 执行补上 `attempt_summaries`
+  - 每个 `shot_id` 现在都会输出：
+    - `planned_provider_chain`
+    - `attempted_providers`
+    - `fallback_used`
+    - `fallback_trigger_reason`
+    - `final_provider`
+    - `final_status`
+    - `judge_ready`
+    - `media_gate_status`
+  - 每次 attempt 也会记录 `submit_status / poll_status / download_status / final_candidate_status`
+- 为 live 候选补上基础 `media_gate`
+  - `evaluate_media_gate()` 根据 `media_probe` 给出 `pass / warn / fail`
+  - `judge_eligible = false` 时，候选状态写为 `media_gate_failed`
+  - `judge_eligible = true` 时，候选状态写为 `ready_for_judge`
+- 为下载媒体新增 `candidate_media_gate` artifact
+  - `*.gate.json` 会和 `*.probe.json` 一起落盘
+- 为 `generate_summary` 增加统计
+  - `media_gate_status_counts`
+  - `gated_out_candidate_count`
+  - `attempt_summaries`
+- 调整 `generate` 文案
+  - 当所有媒体都被 gate 挡掉时，会明确写出“downloaded but gated out before judge”
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 用空文件直接验证 `media_gate fail`：
+  - `tmp/empty_media.mp4`
+  - 结果：`status=fail`, `judge_eligible=false`, `reason=empty_media_file`
+- 继续验证 `Kling -> Vidu` fallback：
+  - run_id: `run_20260319_222858_6c8be5f2`
+- 检查：
+  - `workspace/reports/run_20260319_222858_6c8be5f2__generate_summary.json`
+  - `workspace/review/run_20260319_222858_6c8be5f2__judge_scores.json`
+
+### 效果
+
+- `attempt_summaries` 已真实落盘，并能解释 fallback 原因
+  - 例如：`fallback_trigger_reason = kling_3_0:not_configured`
+- fallback run 中，3 个镜头都显示：
+  - 第 1 次尝试：`kling_3_0 -> not_configured`
+  - 第 2 次尝试：`vidu_q3 -> submitted/completed/downloaded`
+- 当前 fake provider 下载文件会被 `media_gate` 标成：
+  - `status = warn`
+  - `judge_eligible = true`
+  - warning 包含 `ffprobe_unavailable`、`tiny_media_file`
+- 空文件 case 则会被 `media_gate` 直接拦住，不进入 judge
+
+### 问题
+
+- `media_gate` 现在仍是规则式门控，不是基于真实视频内容理解的质量判定
+- 当前 fallback 说明已经足够排障，但还没有更细的 provider-specific cost/latency 归因
+
+### 下一步
+
+- 把 `media_gate` 的 fail/warn 结果接到 `route_back_stage` 或 `review` 决策上
+- 给 `attempt_summaries` 增加成本、耗时和重试次数
+- 再决定是否把 `post` 提升为真实阶段
