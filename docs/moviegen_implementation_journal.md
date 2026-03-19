@@ -1257,3 +1257,61 @@
 
 - 给 `assemble` 增加真正的 release/export 目录产物
 - 或者把 `report` 从 placeholder 提升为真实交付报告阶段
+
+## 2026-03-19 Round 26
+
+### 改动
+
+- 把 `report` 从 placeholder 提升为真实阶段
+  - 消费 `assemble` 产物
+  - 输出：
+    - `delivery_report.json`
+    - `delivery_report.md`
+- `report` 现在会整合：
+  - `post_summary`
+  - `assembly_summary`
+  - `delivery_manifest`
+  - `timeline_manifest`
+  - 当前 run 的 gate 状态
+- 报告内容现在包含：
+  - deliverable 数量
+  - blocked item 数量
+  - timeline 数量
+  - `next_actions`
+  - 每个 deliverable 的文件名、shot、provider、score、gate 状态
+- Markdown 报告也同步生成，便于人工快速浏览
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 使用现有 post project 继续验证：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260319_231237_75acc19b`
+- 检查：
+  - `workspace/reports/run_20260319_231237_75acc19b__delivery_report.json`
+  - `workspace/reports/run_20260319_231237_75acc19b__delivery_report.md`
+  - `status --run-id run_20260319_231237_75acc19b`
+
+### 效果
+
+- `post -> assemble -> report` 最小交付链已真实闭合
+- `run_20260319_231237_75acc19b` 中：
+  - `deliverables = 2`
+  - `blocked_items = 0`
+  - `timeline_items = 2`
+- `delivery_report.json` 已真实包含：
+  - source post summary / assembly summary / delivery manifest / timeline manifest
+  - source review gate
+  - deliverables 列表
+  - next actions
+- `delivery_report.md` 已真实生成可读摘要，便于快速人工检查
+
+### 问题
+
+- `report` 现在仍是“交付报告与汇总”层，不会真正输出 release 目录或复制媒体文件
+- 旧 gate 若历史上已丢失 `decision_summary`，当前报告只能如实显示 null
+
+### 下一步
+
+- 给 `assemble` 或 `report` 增加真实 `release/export` 目录
+- 或者继续把 `post` 提升为真实媒体后处理阶段

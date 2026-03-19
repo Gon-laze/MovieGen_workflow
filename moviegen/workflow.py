@@ -16,7 +16,7 @@ import yaml
 
 from .models import ORDERED_STAGES, ProjectSpec, Stage
 from .providers import TERMINAL_PROVIDER_STATES, infer_media_extension, resolve_adapter
-from .storage import insert_artifact, upsert_candidate_clip, upsert_generation_job, upsert_human_gate, upsert_judge_score
+from .storage import fetch_human_gates, insert_artifact, row_to_dict, upsert_candidate_clip, upsert_generation_job, upsert_human_gate, upsert_judge_score
 
 
 def now_iso() -> str:
@@ -1993,6 +1993,114 @@ def stage_assemble(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     )
 
 
+def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
+    assemble_dir = ctx.root / "workspace" / "assemble"
+    summary_path = assemble_dir / f"{ctx.run_id}__assembly_summary.json"
+    delivery_path = assemble_dir / f"{ctx.run_id}__delivery_manifest.json"
+    timeline_path = assemble_dir / f"{ctx.run_id}__timeline_manifest.json"
+    post_path = ctx.root / "workspace" / "post" / f"{ctx.run_id}__post_summary.json"
+
+    if not summary_path.exists() or not delivery_path.exists():
+        payload = {
+            "report_id": f"report_{uuid4().hex[:12]}",
+            "run_id": ctx.run_id,
+            "deliverables": [],
+            "blocked_items": [],
+            "gates": [row_to_dict(row) for row in fetch_human_gates(ctx.conn, ctx.run_id)],
+            "note": "Report stage found no assemble outputs for this run.",
+            "created_at": now_iso(),
+        }
+        out = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__delivery_report.json"
+        write_json(out, payload)
+        ctx.record_artifact(path=out, artifact_type="delivery_report", source_stage=Stage.REPORT.value)
+        return StageResult(note=payload["note"], artifacts=[out], metadata=payload)
+
+    assemble_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    delivery_manifest = json.loads(delivery_path.read_text(encoding="utf-8"))
+    timeline_manifest = json.loads(timeline_path.read_text(encoding="utf-8")) if timeline_path.exists() else {"timeline_items": []}
+    post_summary = json.loads(post_path.read_text(encoding="utf-8")) if post_path.exists() else {}
+    gates = [row_to_dict(row) for row in fetch_human_gates(ctx.conn, ctx.run_id)]
+
+    deliverables = delivery_manifest.get("delivery_items", []) or []
+    blocked_items = delivery_manifest.get("blocked_items", []) or []
+    source_review_gate = delivery_manifest.get("source_review_gate")
+    payload = {
+        "report_id": f"report_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "source_post_summary": str(post_path) if post_path.exists() else None,
+        "source_assembly_summary": str(summary_path),
+        "source_delivery_manifest": str(delivery_path),
+        "source_timeline_manifest": str(timeline_path) if timeline_path.exists() else None,
+        "source_review_gate": source_review_gate,
+        "gates": gates,
+        "counts": {
+            "deliverables": len(deliverables),
+            "blocked_items": len(blocked_items),
+            "timeline_items": len(timeline_manifest.get("timeline_items", [])),
+            "post_candidates": len(post_summary.get("post_candidates", []) or []),
+        },
+        "deliverables": deliverables,
+        "blocked_items": blocked_items,
+        "next_actions": (
+            ["Proceed to export/release packaging."]
+            if deliverables and not blocked_items
+            else ["Resolve blocked items before packaging."]
+            if blocked_items
+            else ["No deliverables were prepared for this run."]
+        ),
+        "note": (
+            f"Prepared delivery report for {len(deliverables)} deliverables."
+            if deliverables
+            else "Prepared delivery report with no deliverables."
+        ),
+        "created_at": now_iso(),
+    }
+
+    lines = [
+        "# Delivery Report",
+        "",
+        f"- Run ID: `{ctx.run_id}`",
+        f"- Deliverables: `{len(deliverables)}`",
+        f"- Blocked Items: `{len(blocked_items)}`",
+        f"- Timeline Items: `{len(timeline_manifest.get('timeline_items', []))}`",
+    ]
+    if source_review_gate:
+        lines.append(f"- Source Review Gate: `{source_review_gate.get('gate_name')}` / `{source_review_gate.get('status')}`")
+    if payload["next_actions"]:
+        lines.append("")
+        lines.append("## Next Actions")
+        for item in payload["next_actions"]:
+            lines.append(f"- {item}")
+    if deliverables:
+        lines.append("")
+        lines.append("## Deliverables")
+        for item in deliverables:
+            lines.append(
+                f"- `{item.get('delivery_filename')}` from `{item.get('shot_id')}` via `{item.get('provider')}` "
+                f"(score={item.get('weighted_total_score')}, gate={item.get('media_gate_status')})"
+            )
+    if blocked_items:
+        lines.append("")
+        lines.append("## Blocked Items")
+        for item in blocked_items:
+            lines.append(
+                f"- `{item.get('shot_id')}` / `{item.get('candidate_clip_id')}` reason=`{item.get('reason')}`"
+            )
+    markdown = "\n".join(lines) + "\n"
+
+    json_out = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__delivery_report.json"
+    md_out = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__delivery_report.md"
+    write_json(json_out, payload)
+    md_out.write_text(markdown, encoding="utf-8")
+    ctx.record_artifact(path=json_out, artifact_type="delivery_report", source_stage=Stage.REPORT.value)
+    ctx.record_artifact(path=md_out, artifact_type="delivery_report_markdown", source_stage=Stage.REPORT.value)
+    return StageResult(
+        note=payload["note"],
+        artifacts=[json_out, md_out],
+        metadata=payload["counts"],
+    )
+
+
 STAGE_HANDLERS = {
     Stage.INGEST: stage_ingest,
     Stage.ANALYZE: stage_analyze,
@@ -2006,6 +2114,7 @@ STAGE_HANDLERS = {
     Stage.REVIEW: stage_review,
     Stage.POST: stage_post,
     Stage.ASSEMBLE: stage_assemble,
+    Stage.REPORT: stage_report,
 }
 
 
