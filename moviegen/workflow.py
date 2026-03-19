@@ -1535,6 +1535,43 @@ def evaluate_candidate(provider: str, archetype: str, grade: str) -> dict[str, A
     }
 
 
+def apply_media_gate_decision(candidate: dict[str, Any], evaluation: dict[str, Any]) -> dict[str, Any]:
+    media_gate = candidate.get("media_gate")
+    if not isinstance(media_gate, dict):
+        evaluation["decision_reasons"] = []
+        evaluation["media_gate_status"] = None
+        return evaluation
+
+    gate_status = str(media_gate.get("status") or "unknown")
+    gate_reasons = [str(item) for item in media_gate.get("reasons", [])]
+    gate_warnings = [str(item) for item in media_gate.get("warnings", [])]
+    decision_reasons: list[str] = []
+
+    evaluation["media_gate_status"] = gate_status
+    if not media_gate.get("judge_eligible", True):
+        evaluation["weighted_total_score"] = 0.0
+        evaluation["decision"] = "regenerate_same_provider"
+        evaluation["route_back_stage"] = "generate"
+        evaluation["hard_fail"] = True
+        evaluation["hard_fail_reasons"] = (
+            [f"media_gate:{reason}" for reason in gate_reasons]
+            if gate_reasons
+            else [f"media_gate:{gate_status}"]
+        )
+        decision_reasons.append("media_gate_blocked")
+    elif gate_status == "warn" and evaluation["decision"] != "regenerate_same_provider":
+        evaluation["decision"] = "review"
+        evaluation["route_back_stage"] = "review"
+        decision_reasons.append("media_gate_warn")
+
+    if gate_reasons:
+        decision_reasons.extend(f"media_gate_reason:{reason}" for reason in gate_reasons)
+    if gate_warnings:
+        decision_reasons.extend(f"media_gate_warning:{warning}" for warning in gate_warnings)
+    evaluation["decision_reasons"] = decision_reasons
+    return evaluation
+
+
 def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     jobs_path = ctx.root / "workspace" / "jobs" / f"{ctx.run_id}__generation_jobs.json"
     routed_jobs: list[dict[str, Any]] = []
@@ -1546,20 +1583,40 @@ def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     candidates = sorted(candidate_dir.glob(f"{ctx.run_id}__*.json"))
     judge_entries: list[dict[str, Any]] = []
     skipped_candidates: list[dict[str, Any]] = []
+    heuristic_scored_count = 0
+    media_gate_blocked_count = 0
+    media_gate_warn_review_count = 0
     for candidate_path in candidates:
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-        if candidate.get("status") not in JUDGE_READY_CANDIDATE_STATUSES:
+        candidate_status = candidate.get("status")
+        if candidate_status not in JUDGE_READY_CANDIDATE_STATUSES and candidate_status != "media_gate_failed":
             skipped_candidates.append(
                 {
                     "candidate_clip_id": candidate["candidate_clip_id"],
                     "shot_id": candidate["shot_id"],
                     "provider": candidate["provider"],
-                    "reason": f"candidate_status:{candidate.get('status')}",
+                    "reason": f"candidate_status:{candidate_status}",
                 }
             )
             continue
         job = job_index.get(candidate["job_id"], {})
-        evaluation = evaluate_candidate(candidate["provider"], job.get("archetype", "insert_cutaway"), job.get("grade", "B"))
+        if candidate_status == "media_gate_failed":
+            evaluation = {
+                "metrics": {},
+                "weighted_total_score": 0.0,
+                "decision": "regenerate_same_provider",
+                "route_back_stage": "generate",
+                "hard_fail": True,
+                "hard_fail_reasons": [],
+            }
+        else:
+            evaluation = evaluate_candidate(candidate["provider"], job.get("archetype", "insert_cutaway"), job.get("grade", "B"))
+            heuristic_scored_count += 1
+        evaluation = apply_media_gate_decision(candidate, evaluation)
+        if evaluation["hard_fail"]:
+            media_gate_blocked_count += 1
+        if evaluation.get("media_gate_status") == "warn" and evaluation["decision"] == "review":
+            media_gate_warn_review_count += 1
         judge_score_id = f"judge_{uuid4().hex[:12]}"
         entry = {
             "judge_score_id": judge_score_id,
@@ -1595,9 +1652,14 @@ def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         "run_id": ctx.run_id,
         "judge_scores": judge_entries,
         "skipped_candidates": skipped_candidates,
+        "heuristic_scored_count": heuristic_scored_count,
+        "media_gate_blocked_count": media_gate_blocked_count,
+        "media_gate_warn_review_count": media_gate_warn_review_count,
         "note": (
-            "Computed heuristic judge scores for judge-ready candidates."
-            if judge_entries
+            "Applied media gate decisions and computed heuristic judge scores for eligible candidates."
+            if heuristic_scored_count
+            else "Applied media gate decisions; no judge-ready candidates advanced to heuristic scoring."
+            if media_gate_blocked_count
             else "No judge-ready candidates were available for this run."
         ),
         "created_at": now_iso(),

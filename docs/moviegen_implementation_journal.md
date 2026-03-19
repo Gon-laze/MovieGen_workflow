@@ -956,3 +956,67 @@
 - 把 `media_gate` 的 fail/warn 结果接到 `route_back_stage` 或 `review` 决策上
 - 给 `attempt_summaries` 增加成本、耗时和重试次数
 - 再决定是否把 `post` 提升为真实阶段
+
+## 2026-03-19 Round 21
+
+### 改动
+
+- 把 `media_gate` 真正接入 judge 决策层
+  - `media_gate = warn` 时：
+    - 候选仍可进入 judge
+    - 若原本可通过或需人工复审，统一降级为 `decision=review`
+    - `route_back_stage=review`
+  - `media_gate = fail` 时：
+    - 不再跳过候选，而是直接生成 hard-fail judge entry
+    - `decision=regenerate_same_provider`
+    - `route_back_stage=generate`
+    - `hard_fail_reasons` 写入 `media_gate:*`
+- 为 judge entry 增加 gate 解释字段
+  - `media_gate_status`
+  - `decision_reasons`
+- 为 judge summary 增加统计
+  - `heuristic_scored_count`
+  - `media_gate_blocked_count`
+  - `media_gate_warn_review_count`
+- 为 generate summary 增加更清晰的 gate 后结果说明
+  - 如果全部媒体都被 gate 挡住，会明确写出 `gated out before judge`
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 正常小文件链路验证：
+  - run_id: `run_20260319_223318_ee373951`
+  - fake provider 输出小文件，触发 `media_gate=warn`
+- 空文件链路验证：
+  - fake provider 设置 `FAKE_PROVIDER_EMPTY_MEDIA=1`
+  - run_id: `run_20260319_223356_a9224729`
+  - 触发 `media_gate=fail`
+- 检查：
+  - 两个 run 的 `generate_summary`
+  - 两个 run 的 `judge_scores`
+
+### 效果
+
+- `warn -> review` 已真实生效
+  - `run_20260319_223318_ee373951` 中 3 个候选全部：
+    - `decision=review`
+    - `route_back_stage=review`
+    - `decision_reasons` 含 `media_gate_warn`
+- `fail -> generate` 已真实生效
+  - `run_20260319_223356_a9224729` 中 3 个候选全部：
+    - `hard_fail=true`
+    - `decision=regenerate_same_provider`
+    - `route_back_stage=generate`
+    - `hard_fail_reasons` 含 `media_gate:empty_media_file`
+- `attempt_summaries` 继续有效
+  - 可同时解释 provider fallback 与 media gate 最终结果
+
+### 问题
+
+- 当前 `review` 仍是 placeholder stage，虽然决策已能回流到 `review`，但 review 阶段本身还没有真实处理逻辑
+- `media_gate` 仍主要依赖文件级规则；在无 `ffprobe` 的机器上，警告会偏保守
+
+### 下一步
+
+- 把 `review` 从 placeholder 提升为真实阶段，至少能汇总 `media_gate_warn` 候选
+- 或者把 `route_back_stage=generate/review` 真正接到 `resume` / 再执行策略里
