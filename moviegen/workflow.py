@@ -653,17 +653,48 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     routed_jobs: list[dict[str, Any]] = []
     if jobs_path.exists():
         routed_jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
+    packets_path = ctx.root / "workspace" / "prompts" / f"{ctx.run_id}__prompt_packets.json"
+    packets: list[dict[str, Any]] = []
+    if packets_path.exists():
+        packets = json.loads(packets_path.read_text(encoding="utf-8")).get("packets", [])
+    packet_index = {packet["packet_id"]: packet for packet in packets}
 
     candidate_dir = ctx.root / "workspace" / "candidates"
     generated_candidates: list[dict[str, Any]] = []
     provider_requests: list[dict[str, Any]] = []
     for job in routed_jobs:
-        adapter = resolve_adapter(spec, job["provider"])
-        adapter_result = adapter.submit(job)
+        submit_provider = job["provider"]
+        remapped_from_provider = None
+        if spec.execution.live_mode:
+            strategy = spec.execution.submission_strategy
+            if strategy == "primary_only":
+                if submit_provider != spec.execution.primary_provider:
+                    remapped_from_provider = submit_provider
+                    submit_provider = spec.execution.primary_provider
+            elif strategy == "primary_with_optional_fallback":
+                if submit_provider not in {spec.execution.primary_provider, spec.execution.optional_provider}:
+                    remapped_from_provider = submit_provider
+                    submit_provider = spec.execution.primary_provider
+                if submit_provider == spec.execution.optional_provider and not spec.execution.allow_optional_provider_live:
+                    remapped_from_provider = submit_provider
+                    submit_provider = spec.execution.primary_provider
+
+        packet = packet_index.get(job.get("packet_id"))
+        submit_payload = dict(job)
+        if packet:
+            submit_payload.update(packet)
+        submit_payload["planned_provider"] = job["provider"]
+        submit_payload["submit_provider"] = submit_provider
+        submit_payload["remapped_from_provider"] = remapped_from_provider
+
+        adapter = resolve_adapter(spec, submit_provider)
+        adapter_result = adapter.submit(submit_payload)
         provider_requests.append(
             {
                 "job_id": job["job_id"],
-                "provider": job["provider"],
+                "provider": submit_provider,
+                "planned_provider": job["provider"],
+                "remapped_from_provider": remapped_from_provider,
                 "mode": adapter_result.get("mode"),
                 "status": adapter_result.get("status"),
                 "request": adapter_result.get("request"),
@@ -676,17 +707,18 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             "candidate_clip_id": candidate_clip_id,
             "job_id": job["job_id"],
             "shot_id": job["shot_id"],
-            "provider": job["provider"],
-            "provider_model": job["provider_model"],
-            "duration_sec": 0.0,
-            "resolution": "unknown",
-            "has_native_audio": False,
+            "provider": submit_provider,
+            "planned_provider": job["provider"],
+            "provider_model": packet["provider_model"] if packet else job["provider_model"],
+            "duration_sec": (packet or {}).get("generation_params", {}).get("duration_sec", 0.0),
+            "resolution": (packet or {}).get("generation_params", {}).get("resolution_tier", "unknown"),
+            "has_native_audio": bool((packet or {}).get("generation_params", {}).get("native_audio", False)),
             "source_type": "planned_generation",
             "status": "ready",
             "adapter_result": adapter_result,
             "created_at": now_iso(),
         }
-        candidate_path = candidate_dir / f"{job['shot_id']}__{job['provider']}__{candidate_clip_id}.json"
+        candidate_path = candidate_dir / f"{job['shot_id']}__{submit_provider}__{candidate_clip_id}.json"
         write_json(candidate_path, candidate_payload)
         artifact_hash = sha256_file(candidate_path)
         upsert_candidate_clip(
@@ -694,12 +726,12 @@ def stage_generate(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             candidate_clip_id=candidate_clip_id,
             job_id=job["job_id"],
             shot_id=job["shot_id"],
-            provider=job["provider"],
-            provider_model=job["provider_model"],
+            provider=submit_provider,
+            provider_model=(packet or {}).get("provider_model", job["provider_model"]),
             artifact_path=str(candidate_path),
-            duration_sec=0.0,
-            resolution="unknown",
-            has_native_audio=False,
+            duration_sec=float(candidate_payload["duration_sec"]),
+            resolution=str(candidate_payload["resolution"]),
+            has_native_audio=bool(candidate_payload["has_native_audio"]),
             source_type="planned_generation",
             artifact_hash=artifact_hash,
             status="ready",

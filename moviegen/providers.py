@@ -13,6 +13,7 @@ from .models import ProjectSpec
 class ProviderAdapter:
     provider_name: str
     live_mode: bool = False
+    timeout_sec: int = 60
 
     def build_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -35,8 +36,8 @@ class ProviderAdapter:
 
 
 class KlingAdapter(ProviderAdapter):
-    def __init__(self, live_mode: bool = False) -> None:
-        super().__init__(provider_name="kling_3_0", live_mode=live_mode)
+    def __init__(self, live_mode: bool = False, timeout_sec: int = 60) -> None:
+        super().__init__(provider_name="kling_3_0", live_mode=live_mode, timeout_sec=timeout_sec)
 
     def build_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = {
@@ -85,7 +86,7 @@ class KlingAdapter(ProviderAdapter):
         data = json.dumps(request_payload["body"]).encode("utf-8")
         req = request.Request(url, data=data, headers=request_payload["headers"], method="POST")
         try:
-            with request.urlopen(req, timeout=60) as resp:
+            with request.urlopen(req, timeout=self.timeout_sec) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
             parsed = json.loads(raw) if raw.strip().startswith(("{", "[")) else {"raw": raw}
             return {
@@ -117,8 +118,8 @@ class KlingAdapter(ProviderAdapter):
 
 
 class ViduAdapter(ProviderAdapter):
-    def __init__(self, live_mode: bool = False) -> None:
-        super().__init__(provider_name="vidu_q3", live_mode=live_mode)
+    def __init__(self, live_mode: bool = False, timeout_sec: int = 60) -> None:
+        super().__init__(provider_name="vidu_q3", live_mode=live_mode, timeout_sec=timeout_sec)
 
     def build_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = {
@@ -167,7 +168,7 @@ class ViduAdapter(ProviderAdapter):
         data = json.dumps(request_payload["body"]).encode("utf-8")
         req = request.Request(url, data=data, headers=request_payload["headers"], method="POST")
         try:
-            with request.urlopen(req, timeout=60) as resp:
+            with request.urlopen(req, timeout=self.timeout_sec) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
             parsed = json.loads(raw) if raw.strip().startswith(("{", "[")) else {"raw": raw}
             return {
@@ -205,7 +206,7 @@ class GenericAdapter(ProviderAdapter):
 def resolve_adapter(spec: ProjectSpec, provider_name: str) -> ProviderAdapter:
     live_mode = spec.execution.live_mode
     if provider_name == spec.execution.primary_provider:
-        return KlingAdapter(live_mode=live_mode)
+        return KlingAdapter(live_mode=live_mode, timeout_sec=spec.execution.request_timeout_sec)
     if provider_name == spec.execution.optional_provider:
-        return ViduAdapter(live_mode=live_mode)
-    return GenericAdapter(provider_name=provider_name, live_mode=live_mode)
+        return ViduAdapter(live_mode=live_mode, timeout_sec=spec.execution.request_timeout_sec)
+    return GenericAdapter(provider_name=provider_name, live_mode=live_mode, timeout_sec=spec.execution.request_timeout_sec)

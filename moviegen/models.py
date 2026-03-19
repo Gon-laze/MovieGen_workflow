@@ -119,6 +119,8 @@ class ExecutionSection(BaseModel):
     live_mode: bool = False
     request_timeout_sec: int = Field(default=60, ge=1)
     save_provider_requests: bool = True
+    submission_strategy: Literal["primary_only", "primary_with_optional_fallback", "planned"] = "primary_only"
+    allow_optional_provider_live: bool = True
 
 
 class ProjectSpec(BaseModel):
