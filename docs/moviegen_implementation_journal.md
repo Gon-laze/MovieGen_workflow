@@ -1315,3 +1315,69 @@
 
 - 给 `assemble` 或 `report` 增加真实 `release/export` 目录
 - 或者继续把 `post` 提升为真实媒体后处理阶段
+
+## 2026-03-19 Round 27
+
+### 改动
+
+- 为 `report` 增加真实 `release/export` 输出
+  - 导出目录：`workspace/release/<run_id>/`
+  - 结构包括：
+    - `media/`
+    - `docs/`
+    - `release_manifest.json`
+- `report` 现在会：
+  - 复制每个 deliverable 的媒体文件到 `release/media/`
+  - 复制关键文档到 `release/docs/`
+    - `delivery_report.json`
+    - `delivery_report.md`
+    - `assembly_summary.json`
+    - `delivery_manifest.json`
+    - `timeline_manifest.json`
+    - `post_summary.json`
+- 生成真实 `release_manifest.json`
+  - 记录 exported media、copied docs、blocked items
+- `delivery_report.json` 现在也会包含：
+  - `release_export.release_dir`
+  - `exported_media_count`
+  - `copied_docs_count`
+  - `release_manifest_path`
+- `delivery_report.md` 同步补充 `Release Export` 小节
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 使用现有 post project 继续验证：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260319_232422_3fa0771f`
+- 检查：
+  - `workspace/reports/run_20260319_232422_3fa0771f__delivery_report.json`
+  - `workspace/release/run_20260319_232422_3fa0771f/release_manifest.json`
+  - `Get-ChildItem -Recurse workspace/release/run_20260319_232422_3fa0771f`
+  - `status --run-id run_20260319_232422_3fa0771f`
+
+### 效果
+
+- 现在 `post -> assemble -> report -> release/export` 最小交付链已真实闭合
+- `run_20260319_232422_3fa0771f` 中：
+  - `exported_media_count = 2`
+  - `copied_docs_count = 6`
+  - `blocked_items_count = 0`
+- release 目录已真实包含：
+  - 2 个媒体文件副本
+  - 6 份关键文档副本
+  - `release_manifest.json`
+- `delivery_report` 的 `next_actions` 现在会直接指向 release 目录，便于交付检查
+
+### 问题
+
+- 当前 export 是“复制式 release”，还不是更复杂的发布机制
+  - 没有压缩包
+  - 没有 checksum 清单分发格式
+  - 没有正式的版本号语义
+- 媒体文件当前按 manifest 中的稳定文件名导出，但还没有做冲突检测之外的更强 release 规范
+
+### 下一步
+
+- 如果继续推进，最自然的是给 release 目录增加 zip/export 包
+- 或者补真正的 versioned delivery manifest / checksum 清单

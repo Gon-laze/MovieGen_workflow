@@ -2092,12 +2092,142 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     md_out = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__delivery_report.md"
     write_json(json_out, payload)
     md_out.write_text(markdown, encoding="utf-8")
+
+    release_dir = ctx.root / "workspace" / "release" / ctx.run_id
+    release_media_dir = release_dir / "media"
+    release_docs_dir = release_dir / "docs"
+    release_media_dir.mkdir(parents=True, exist_ok=True)
+    release_docs_dir.mkdir(parents=True, exist_ok=True)
+
+    exported_media: list[dict[str, Any]] = []
+    export_blocked_items: list[dict[str, Any]] = []
+    for item in deliverables:
+        source_media_path = Path(str(item.get("source_media_path") or ""))
+        destination = release_media_dir / str(item.get("delivery_filename") or source_media_path.name)
+        if not source_media_path.exists():
+            export_blocked_items.append(
+                {
+                    "candidate_clip_id": item.get("candidate_clip_id"),
+                    "shot_id": item.get("shot_id"),
+                    "reason": "missing_source_media",
+                    "source_media_path": str(source_media_path),
+                }
+            )
+            continue
+        try:
+            shutil.copy2(source_media_path, destination)
+            exported_media.append(
+                {
+                    "candidate_clip_id": item.get("candidate_clip_id"),
+                    "shot_id": item.get("shot_id"),
+                    "provider": item.get("provider"),
+                    "delivery_filename": destination.name,
+                    "source_media_path": str(source_media_path),
+                    "exported_media_path": str(destination),
+                    "file_size_bytes": destination.stat().st_size,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            export_blocked_items.append(
+                {
+                    "candidate_clip_id": item.get("candidate_clip_id"),
+                    "shot_id": item.get("shot_id"),
+                    "reason": "export_copy_failed",
+                    "source_media_path": str(source_media_path),
+                    "error": str(exc),
+                }
+            )
+
+    copied_docs: list[dict[str, Any]] = []
+    for source in [json_out, md_out, summary_path, delivery_path, timeline_path, post_path]:
+        if source is None or not Path(source).exists():
+            continue
+        source_path = Path(source)
+        destination = release_docs_dir / source_path.name
+        shutil.copy2(source_path, destination)
+        copied_docs.append(
+            {
+                "source_path": str(source_path),
+                "exported_path": str(destination),
+            }
+        )
+
+    release_manifest = {
+        "release_manifest_id": f"release_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "release_dir": str(release_dir),
+        "exported_media": exported_media,
+        "copied_docs": copied_docs,
+        "blocked_items": blocked_items + export_blocked_items,
+        "counts": {
+            "exported_media": len(exported_media),
+            "copied_docs": len(copied_docs),
+            "blocked_items": len(blocked_items) + len(export_blocked_items),
+        },
+        "created_at": now_iso(),
+    }
+    release_manifest_path = release_dir / "release_manifest.json"
+    write_json(release_manifest_path, release_manifest)
+    payload["release_export"] = {
+        "release_dir": str(release_dir),
+        "exported_media_count": len(exported_media),
+        "copied_docs_count": len(copied_docs),
+        "blocked_items_count": len(blocked_items) + len(export_blocked_items),
+        "release_manifest_path": str(release_manifest_path),
+    }
+    payload["next_actions"] = (
+        [f"Review exported release directory: {release_dir}", "Proceed to delivery or packaging checks."]
+        if exported_media and not (blocked_items or export_blocked_items)
+        else [f"Review partial export in: {release_dir}", "Resolve blocked export items before delivery."]
+        if exported_media
+        else ["No media was exported; resolve blocked items first."]
+    )
+    payload["blocked_items"] = blocked_items + export_blocked_items
+    payload["note"] = (
+        f"Prepared delivery report and exported {len(exported_media)} deliverables."
+        if exported_media
+        else "Prepared delivery report with no exported deliverables."
+    )
+    write_json(json_out, payload)
+    md_lines = markdown.rstrip().splitlines()
+    md_lines.extend(
+        [
+            "",
+            "## Release Export",
+            f"- Release Dir: `{release_dir}`",
+            f"- Exported Media: `{len(exported_media)}`",
+            f"- Copied Docs: `{len(copied_docs)}`",
+            f"- Blocked Export Items: `{len(blocked_items) + len(export_blocked_items)}`",
+        ]
+    )
+    md_out.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
     ctx.record_artifact(path=json_out, artifact_type="delivery_report", source_stage=Stage.REPORT.value)
     ctx.record_artifact(path=md_out, artifact_type="delivery_report_markdown", source_stage=Stage.REPORT.value)
+    ctx.record_artifact(path=release_manifest_path, artifact_type="release_manifest", source_stage=Stage.REPORT.value)
+    for item in exported_media:
+        exported_path = Path(item["exported_media_path"])
+        ctx.record_artifact(
+            path=exported_path,
+            artifact_type="release_media",
+            source_stage=Stage.REPORT.value,
+            source_id=item.get("candidate_clip_id"),
+            retention_policy="keep",
+        )
+    for item in copied_docs:
+        exported_path = Path(item["exported_path"])
+        ctx.record_artifact(
+            path=exported_path,
+            artifact_type="release_doc",
+            source_stage=Stage.REPORT.value,
+            retention_policy="keep",
+        )
     return StageResult(
         note=payload["note"],
-        artifacts=[json_out, md_out],
-        metadata=payload["counts"],
+        artifacts=[json_out, md_out, release_manifest_path],
+        metadata={
+            **payload["counts"],
+            **payload["release_export"],
+        },
     )
 
 
