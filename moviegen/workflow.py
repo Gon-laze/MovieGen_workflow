@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2168,17 +2169,46 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     }
     release_manifest_path = release_dir / "release_manifest.json"
     write_json(release_manifest_path, release_manifest)
+    checksum_entries: list[dict[str, Any]] = []
+    for path in sorted(p for p in release_dir.rglob("*") if p.is_file()):
+        checksum_entries.append(
+            {
+                "relative_path": str(path.relative_to(release_dir)).replace("\\", "/"),
+                "absolute_path": str(path),
+                "sha256": sha256_file(path),
+                "file_size_bytes": path.stat().st_size,
+            }
+        )
+    checksums_manifest = {
+        "checksums_manifest_id": f"checksums_{uuid4().hex[:12]}",
+        "run_id": ctx.run_id,
+        "release_dir": str(release_dir),
+        "entries": checksum_entries,
+        "created_at": now_iso(),
+    }
+    checksums_manifest_path = ctx.root / "workspace" / "release" / f"{ctx.run_id}__checksums.json"
+    write_json(checksums_manifest_path, checksums_manifest)
+
+    zip_path = ctx.root / "workspace" / "release" / f"{ctx.run_id}.zip"
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(p for p in release_dir.rglob("*") if p.is_file()):
+            arcname = f"{ctx.run_id}/{str(path.relative_to(release_dir)).replace('\\', '/')}"
+            archive.write(path, arcname=arcname)
+    zip_sha256 = sha256_file(zip_path)
     payload["release_export"] = {
         "release_dir": str(release_dir),
         "exported_media_count": len(exported_media),
         "copied_docs_count": len(copied_docs),
         "blocked_items_count": len(blocked_items) + len(export_blocked_items),
         "release_manifest_path": str(release_manifest_path),
+        "checksums_manifest_path": str(checksums_manifest_path),
+        "zip_path": str(zip_path),
+        "zip_sha256": zip_sha256,
     }
     payload["next_actions"] = (
-        [f"Review exported release directory: {release_dir}", "Proceed to delivery or packaging checks."]
+        [f"Review exported release directory: {release_dir}", f"Validate checksums via {checksums_manifest_path}", f"Distribute archive: {zip_path}"]
         if exported_media and not (blocked_items or export_blocked_items)
-        else [f"Review partial export in: {release_dir}", "Resolve blocked export items before delivery."]
+        else [f"Review partial export in: {release_dir}", f"Inspect checksum manifest: {checksums_manifest_path}", "Resolve blocked export items before delivery."]
         if exported_media
         else ["No media was exported; resolve blocked items first."]
     )
@@ -2198,12 +2228,17 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             f"- Exported Media: `{len(exported_media)}`",
             f"- Copied Docs: `{len(copied_docs)}`",
             f"- Blocked Export Items: `{len(blocked_items) + len(export_blocked_items)}`",
+            f"- Checksum Manifest: `{checksums_manifest_path}`",
+            f"- Zip Archive: `{zip_path}`",
+            f"- Zip SHA256: `{zip_sha256}`",
         ]
     )
     md_out.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
     ctx.record_artifact(path=json_out, artifact_type="delivery_report", source_stage=Stage.REPORT.value)
     ctx.record_artifact(path=md_out, artifact_type="delivery_report_markdown", source_stage=Stage.REPORT.value)
     ctx.record_artifact(path=release_manifest_path, artifact_type="release_manifest", source_stage=Stage.REPORT.value)
+    ctx.record_artifact(path=checksums_manifest_path, artifact_type="release_checksums", source_stage=Stage.REPORT.value)
+    ctx.record_artifact(path=zip_path, artifact_type="release_zip_archive", source_stage=Stage.REPORT.value)
     for item in exported_media:
         exported_path = Path(item["exported_media_path"])
         ctx.record_artifact(

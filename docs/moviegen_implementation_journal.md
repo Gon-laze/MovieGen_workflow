@@ -1381,3 +1381,67 @@
 
 - 如果继续推进，最自然的是给 release 目录增加 zip/export 包
 - 或者补真正的 versioned delivery manifest / checksum 清单
+
+## 2026-03-19 Round 28
+
+### 改动
+
+- 为 `report -> release/export` 再补两类正式交付产物
+  - `workspace/release/<run_id>.zip`
+  - `workspace/release/<run_id>__checksums.json`
+- checksum 清单现在会覆盖整个 release 目录内的文件
+  - `media/`
+  - `docs/`
+  - `release_manifest.json`
+- `delivery_report.json` 现在新增：
+  - `release_export.checksums_manifest_path`
+  - `release_export.zip_path`
+  - `release_export.zip_sha256`
+- `delivery_report.md` 也新增 `Release Export` 信息：
+  - release 目录
+  - checksum 清单
+  - zip 包路径
+  - zip SHA256
+- `status --run-id` 中的 artifact 现在也会包含：
+  - `release_checksums`
+  - `release_zip_archive`
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 使用现有 post project 再跑一轮：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260319_232659_bcdbb059`
+- 检查：
+  - `workspace/reports/run_20260319_232659_bcdbb059__delivery_report.json`
+  - `workspace/release/run_20260319_232659_bcdbb059__checksums.json`
+  - `workspace/release/run_20260319_232659_bcdbb059.zip`
+  - `status --run-id run_20260319_232659_bcdbb059`
+
+### 效果
+
+- 现在 release/export 已形成完整三件套：
+  - release 目录
+  - checksum 清单
+  - zip 包
+- `run_20260319_232659_bcdbb059` 中：
+  - `exported_media_count = 2`
+  - `copied_docs_count = 6`
+  - `zip_sha256 = 51b85ecd9e5259fe837467e4e1abcf4d86a01434338bcdf432180c739967a79e`
+- `release_checksums.json` 已真实列出 release 目录下每个文件的 sha256 和大小
+- `delivery_report.json` 的 `next_actions` 现在会直接指向：
+  - release 目录
+  - checksum 清单
+  - zip 包
+
+### 问题
+
+- 当前 zip/export 还是单机本地交付形式，没有版本号策略和多版本保留规则
+- checksum 清单目前是 JSON，不是更常见的 `.sha256` 文本格式；如果后续要给外部流水线消费，可能还需要追加一种文本输出
+
+### 下一步
+
+- 如果继续推进，最自然的是给 release 再补：
+  - `.sha256` 文本校验文件
+  - versioned release naming
+  - 或真正的 post-processing 阶段
