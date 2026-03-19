@@ -1828,19 +1828,123 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             approved_candidates = review_payload.get("approved_candidates", []) or []
             source_review_gate = review_payload.get("gate")
 
-    post_candidates = [
-        {
-            "candidate_clip_id": item["candidate_clip_id"],
-            "shot_id": item["shot_id"],
-            "provider": item.get("provider"),
-            "planned_provider": item.get("planned_provider"),
-            "source_type": item.get("source_type"),
-            "media_artifact_path": item.get("media_artifact_path"),
-            "media_gate_status": item.get("media_gate_status"),
-            "weighted_total_score": item.get("weighted_total_score"),
+    ffmpeg_path = shutil.which("ffmpeg")
+    processing_mode = "ffmpeg_stream_copy" if ffmpeg_path else "file_copy_fallback"
+    processed_dir = ctx.root / "workspace" / "post" / "processed" / ctx.run_id
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    post_candidates: list[dict[str, Any]] = []
+    post_jobs: list[dict[str, Any]] = []
+    post_blocked_items: list[dict[str, Any]] = []
+    for index, item in enumerate(sorted(approved_candidates, key=lambda entry: str(entry.get("shot_id") or "")), start=1):
+        source_media_path = Path(str(item.get("media_artifact_path") or ""))
+        if not source_media_path.exists():
+            post_blocked_items.append(
+                {
+                    "candidate_clip_id": item["candidate_clip_id"],
+                    "shot_id": item["shot_id"],
+                    "provider": item.get("provider"),
+                    "reason": "missing_source_media",
+                    "source_media_artifact_path": str(source_media_path),
+                }
+            )
+            continue
+
+        processed_filename = f"{index:03d}__{item['shot_id']}__{item['candidate_clip_id']}{source_media_path.suffix}"
+        processed_path = processed_dir / processed_filename
+        operation = {
+            "mode": processing_mode,
+            "source_media_artifact_path": str(source_media_path),
+            "processed_media_path": str(processed_path),
+            "ffmpeg_path": ffmpeg_path,
         }
-        for item in approved_candidates
-    ]
+        try:
+            if ffmpeg_path:
+                cmd = [
+                    ffmpeg_path,
+                    "-y",
+                    "-i",
+                    str(source_media_path),
+                    "-c",
+                    "copy",
+                    str(processed_path),
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+                operation["returncode"] = result.returncode
+                if result.returncode != 0:
+                    operation["stderr"] = result.stderr.strip()[:1000]
+                    raise RuntimeError("ffmpeg_stream_copy_failed")
+            else:
+                shutil.copy2(source_media_path, processed_path)
+
+            processed_probe = probe_media_file(processed_path)
+            processed_gate = evaluate_media_gate(processed_probe)
+            processed_record = {
+                "candidate_clip_id": item["candidate_clip_id"],
+                "shot_id": item["shot_id"],
+                "provider": item.get("provider"),
+                "planned_provider": item.get("planned_provider"),
+                "source_type": item.get("source_type"),
+                "source_media_artifact_path": str(source_media_path),
+                "media_artifact_path": str(processed_path),
+                "media_gate_status": item.get("media_gate_status"),
+                "weighted_total_score": item.get("weighted_total_score"),
+                "post_processing_mode": processing_mode,
+                "post_processing_status": "processed",
+                "post_processing_details": operation,
+                "processed_media_probe": processed_probe,
+                "processed_media_gate": processed_gate,
+            }
+            post_candidates.append(processed_record)
+            post_jobs.append(
+                {
+                    "candidate_clip_id": item["candidate_clip_id"],
+                    "shot_id": item["shot_id"],
+                    "provider": item.get("provider"),
+                    "status": "processed",
+                    "processing_mode": processing_mode,
+                    "processed_media_path": str(processed_path),
+                }
+            )
+            ctx.record_artifact(
+                path=processed_path,
+                artifact_type="post_processed_media",
+                source_stage=Stage.POST.value,
+                source_id=item["candidate_clip_id"],
+                retention_policy="keep",
+            )
+            probe_path = processed_path.with_suffix(f"{processed_path.suffix}.probe.json")
+            gate_path = processed_path.with_suffix(f"{processed_path.suffix}.gate.json")
+            write_json(probe_path, processed_probe)
+            write_json(gate_path, processed_gate)
+            ctx.record_artifact(
+                path=probe_path,
+                artifact_type="post_processed_probe",
+                source_stage=Stage.POST.value,
+                source_id=item["candidate_clip_id"],
+                retention_policy="keep",
+            )
+            ctx.record_artifact(
+                path=gate_path,
+                artifact_type="post_processed_gate",
+                source_stage=Stage.POST.value,
+                source_id=item["candidate_clip_id"],
+                retention_policy="keep",
+            )
+        except Exception as exc:  # noqa: BLE001
+            post_blocked_items.append(
+                {
+                    "candidate_clip_id": item["candidate_clip_id"],
+                    "shot_id": item["shot_id"],
+                    "provider": item.get("provider"),
+                    "reason": "post_processing_failed",
+                    "source_media_artifact_path": str(source_media_path),
+                    "processed_media_path": str(processed_path),
+                    "error": str(exc),
+                    "processing_mode": processing_mode,
+                }
+            )
+
     blocked_candidates = [
         {
             "candidate_clip_id": item["candidate_clip_id"],
@@ -1859,19 +1963,22 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         }
         for item in regenerate_candidates
     )
+    blocked_candidates.extend(post_blocked_items)
 
     payload = {
         "post_id": f"post_{uuid4().hex[:12]}",
         "run_id": ctx.run_id,
+        "post_jobs": post_jobs,
         "post_candidates": post_candidates,
         "blocked_candidates": blocked_candidates,
         "source_review_gate": source_review_gate,
+        "processing_mode": processing_mode,
         "counts": {
             "post_candidates": len(post_candidates),
             "blocked_candidates": len(blocked_candidates),
         },
         "note": (
-            f"Prepared post queue for {len(post_candidates)} approved candidates."
+            f"Prepared post outputs for {len(post_candidates)} approved candidates."
             if post_candidates
             else "Post stage found no approved candidates to continue."
         ),

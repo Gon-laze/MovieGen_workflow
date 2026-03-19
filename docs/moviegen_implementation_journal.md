@@ -1508,3 +1508,62 @@
 
 - 如果继续推进，最自然的是再补一个 `zip.sha256` 单文件
 - 或者开始进入真正的 `post` 媒体后处理实现
+
+## 2026-03-19 Round 30
+
+### 改动
+
+- 把 `post` 从“后处理前排队”提升为最小可执行的媒体处理阶段
+  - 当本机存在 `ffmpeg` 时：预留 `ffmpeg_stream_copy` 无损 remux 路径
+  - 当前环境无 `ffmpeg`，实际走 `file_copy_fallback`
+- `post` 现在会真实产出处理后的媒体文件
+  - 目录：`workspace/post/processed/<run_id>/`
+- 每个 post candidate 现在都会带：
+  - `source_media_artifact_path`
+  - `media_artifact_path`（处理后媒体）
+  - `post_processing_mode`
+  - `post_processing_status`
+  - `post_processing_details`
+  - `processed_media_probe`
+  - `processed_media_gate`
+- `stage_post` 现在还会写入：
+  - `post_jobs`
+  - `post_processed_media` artifact
+  - `post_processed_probe` artifact
+  - `post_processed_gate` artifact
+- `assemble` 与后续 `release/export` 现在默认消费 `post` 处理后的媒体，而不再直接指向原下载媒体
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 继续跑一轮 post -> report：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260319_233248_3f6aa32d`
+- 检查：
+  - `workspace/post/run_20260319_233248_3f6aa32d__post_summary.json`
+  - `workspace/post/processed/run_20260319_233248_3f6aa32d/`
+  - `workspace/reports/run_20260319_233248_3f6aa32d__delivery_report.json`
+  - `status --run-id run_20260319_233248_3f6aa32d`
+
+### 效果
+
+- `post` 现在已经成为真实媒体处理入口，而不是纯汇总阶段
+- 当前环境下成功走通：
+  - `file_copy_fallback`
+  - 并为每个 approved candidate 生成处理后媒体文件、probe、gate sidecar
+- `run_20260319_233248_3f6aa32d` 中：
+  - `post_jobs = 2`
+  - `post_processed_media = 2`
+  - release/export 已改为引用 `workspace/post/processed/...` 的处理后媒体
+- 版本化 release 也已继续递增：
+  - 本轮生成 `moviegen_scifi_001__v002__run_20260319_233248_3f6aa32d`
+
+### 问题
+
+- 当前机器没有 `ffmpeg/ffprobe`，所以 post 仍走 copy fallback，尚未进入真正 remux/transcode
+- `processed_media_gate` 目前仍是规则式门控，不是基于真实视频内容理解的后处理质检
+
+### 下一步
+
+- 如果继续推进，最自然的是补 `ffmpeg` 可用时的真实 remux/transcode 参数模板
+- 或者给 release 再补一个单独的 zip 校验文件
