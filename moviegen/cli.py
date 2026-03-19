@@ -9,6 +9,7 @@ from typing import Optional
 from uuid import uuid4
 
 import typer
+import yaml
 
 from .config import load_project_spec
 from .models import ORDERED_STAGES, ProjectSpec, Stage, resolve_stage_sequence
@@ -100,6 +101,31 @@ def build_summary(spec: ProjectSpec, run_id: str, stages: list[Stage], dry_run: 
     }
 
 
+def resolve_requested_stages(stage: Stage, force_stage: Optional[str]) -> list[Stage]:
+    stages = resolve_stage_sequence(stage)
+    if force_stage and stage == Stage.ALL:
+        target = next((item for item in ORDERED_STAGES if item.value == force_stage), None)
+        if target is None:
+            raise typer.Exit(code=11)
+        start_index = ORDERED_STAGES.index(target)
+        return ORDERED_STAGES[start_index:].copy()
+    return stages
+
+
+def load_shot_specs_file(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        return payload.get("shot_specs", []) or []
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
 def write_run_artifacts(root: Path, run_id: str, summary: dict[str, object]) -> tuple[Path, Path]:
     reports_dir = root / "workspace" / "reports"
     summary_path = reports_dir / f"{run_id}__run_summary.json"
@@ -120,7 +146,7 @@ def execute_run(
 ) -> dict[str, object]:
     ensure_runtime_dirs(root)
     spec = load_project_spec(project_file)
-    stages = resolve_stage_sequence(stage)
+    stages = resolve_requested_stages(stage, force_stage)
     current_run_id = run_id or make_run_id()
     db_path = root / "state" / "moviegen.db"
     conn = connect(db_path)
@@ -317,14 +343,186 @@ def doctor() -> None:
 
 
 @app.command()
-def resume(run_id: str = typer.Option(..., "--run-id")) -> None:
+def resume(
+    run_id: str = typer.Option(..., "--run-id"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
     root = Path.cwd()
     conn = connect(root / "state" / "moviegen.db")
     init_db(conn)
     row = fetch_run(conn, run_id)
     if row is None:
         raise typer.Exit(code=30)
-    typer.echo(json.dumps({"run_id": run_id, "status": row["status"], "message": "resume scaffold currently performs no additional work"}, ensure_ascii=False))
+    review_summary_path = root / "workspace" / "review" / f"{run_id}__review_summary.json"
+    if not review_summary_path.exists():
+        typer.echo(json.dumps({"run_id": run_id, "status": row["status"], "message": "review summary is missing; nothing to resume"}, ensure_ascii=False))
+        return
+
+    review_payload = json.loads(review_summary_path.read_text(encoding="utf-8"))
+    gates = {gate_row["gate_name"]: row_to_dict(gate_row) for gate_row in fetch_human_gates(conn, run_id)}
+    review_gate = gates.get("gate_3_review")
+
+    if review_payload.get("review_candidates") and (review_gate is None or review_gate.get("status") == "waiting"):
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "status": row["status"],
+                    "message": "review gate is still waiting; approve or reject candidates before resume",
+                    "gate": review_gate,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    candidate_map: dict[str, dict[str, object]] = {}
+    for section in ("review_candidates", "regenerate_candidates", "approved_candidates"):
+        for item in review_payload.get(section, []):
+            candidate_map[item["candidate_clip_id"]] = item
+
+    gate_payload = {}
+    if review_gate and review_gate.get("decision_payload"):
+        gate_payload = json.loads(str(review_gate["decision_payload"]))
+
+    rerun_candidate_ids = {item["candidate_clip_id"] for item in review_payload.get("regenerate_candidates", [])}
+    rerun_candidate_ids.update(gate_payload.get("rejected_ids", []))
+    rerun_shot_ids = sorted(
+        {
+            str(candidate_map[candidate_id]["shot_id"])
+            for candidate_id in rerun_candidate_ids
+            if candidate_id in candidate_map
+        }
+    )
+
+    resume_plan = {
+        "source_run_id": run_id,
+        "source_project_file": row["project_file"],
+        "review_gate": review_gate,
+        "rerun_candidate_ids": sorted(rerun_candidate_ids),
+        "rerun_shot_ids": rerun_shot_ids,
+        "created_at": now_iso(),
+    }
+    resume_plan_path = root / "workspace" / "review" / f"{run_id}__resume_plan.json"
+    resume_plan_path.write_text(json.dumps(resume_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    insert_artifact(
+        conn,
+        artifact_id=f"artifact_{uuid4().hex[:12]}",
+        run_id=run_id,
+        artifact_type="resume_plan",
+        artifact_path=str(resume_plan_path),
+        source_stage="review",
+        source_id=run_id,
+        content_hash=sha256_file(resume_plan_path),
+        file_size_bytes=resume_plan_path.stat().st_size,
+        retention_policy="keep",
+        created_at=now_iso(),
+    )
+
+    if not rerun_shot_ids:
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "status": row["status"],
+                    "message": "no rerun candidates were selected; resume completed without launching a follow-up run",
+                    "resume_plan_path": str(resume_plan_path),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    source_project_file = Path(str(row["project_file"]))
+    if not source_project_file.is_absolute():
+        source_project_file = root / source_project_file
+    project_payload = yaml.safe_load(source_project_file.read_text(encoding="utf-8")) or {}
+    planning = project_payload.setdefault("planning", {})
+    shot_specs_file = planning.get("shot_specs_file")
+    if not shot_specs_file:
+        raise typer.Exit(code=31)
+
+    shot_specs_path = Path(str(shot_specs_file))
+    if not shot_specs_path.is_absolute():
+        shot_specs_path = root / shot_specs_path
+    shot_specs = load_shot_specs_file(shot_specs_path)
+    filtered_shots = [shot for shot in shot_specs if str(shot.get("shot_id")) in rerun_shot_ids]
+    if not filtered_shots:
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "status": row["status"],
+                    "message": "rerun shot ids were resolved, but no matching shot specs were found",
+                    "rerun_shot_ids": rerun_shot_ids,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    followup_run_id = make_run_id()
+    resume_shots_path = root / "workspace" / "review" / f"{followup_run_id}__resume_shot_specs.yaml"
+    resume_project_path = root / "workspace" / "review" / f"{followup_run_id}__resume_project.yaml"
+    resume_shots_path.write_text(
+        yaml.safe_dump({"shot_specs": filtered_shots}, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    planning["shot_specs_file"] = str(resume_shots_path.relative_to(root)).replace("\\", "/")
+    resume_project_path.write_text(
+        yaml.safe_dump(project_payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    insert_artifact(
+        conn,
+        artifact_id=f"artifact_{uuid4().hex[:12]}",
+        run_id=run_id,
+        artifact_type="resume_shot_specs",
+        artifact_path=str(resume_shots_path),
+        source_stage="review",
+        source_id=followup_run_id,
+        content_hash=sha256_file(resume_shots_path),
+        file_size_bytes=resume_shots_path.stat().st_size,
+        retention_policy="keep",
+        created_at=now_iso(),
+    )
+    insert_artifact(
+        conn,
+        artifact_id=f"artifact_{uuid4().hex[:12]}",
+        run_id=run_id,
+        artifact_type="resume_project_file",
+        artifact_path=str(resume_project_path),
+        source_stage="review",
+        source_id=followup_run_id,
+        content_hash=sha256_file(resume_project_path),
+        file_size_bytes=resume_project_path.stat().st_size,
+        retention_policy="keep",
+        created_at=now_iso(),
+    )
+
+    followup_payload = execute_run(
+        root=root,
+        project_file=resume_project_path,
+        stage=Stage.ALL,
+        run_id=followup_run_id,
+        force_stage=Stage.PLAN.value,
+        dry_run=dry_run,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "source_run_id": run_id,
+                "resume_plan_path": str(resume_plan_path),
+                "followup_run": followup_payload,
+                "rerun_shot_ids": rerun_shot_ids,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 @app.command()
@@ -382,6 +580,10 @@ def gate(
     init_db(conn)
     if fetch_run(conn, run_id) is None:
         raise typer.Exit(code=30)
+    existing_gate = next(
+        (row_to_dict(gate_row) for gate_row in fetch_human_gates(conn, run_id) if gate_row["gate_name"] == gate_name),
+        None,
+    )
     approved_ids = [item for item in (approve or "").split(",") if item]
     rejected_ids = [item for item in (reject or "").split(",") if item]
     payload = {
@@ -396,8 +598,8 @@ def gate(
         run_id=run_id,
         gate_name=gate_name,
         status=status,
-        reviewer=reviewer,
-        decision_summary=decision_summary,
+        reviewer=reviewer or (existing_gate or {}).get("reviewer"),
+        decision_summary=decision_summary if decision_summary is not None else (existing_gate or {}).get("decision_summary"),
         decision_payload=json.dumps(payload, ensure_ascii=False),
         created_at=timestamp,
         updated_at=timestamp,

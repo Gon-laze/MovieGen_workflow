@@ -1079,3 +1079,64 @@
 
 - 把 `resume` / 再执行策略接到 `review_summary` 和 `route_back_stage`
 - 或者把 `gate --approve/--reject` 的结果进一步驱动后续 stage
+
+## 2026-03-19 Round 23
+
+### 改动
+
+- 为 `execute_run()` 补上 `force_stage` 真实语义
+  - 当 `stage=all` 且 `force_stage=plan` 时，会从 `plan` 继续跑到 `report`
+- 把 `resume` 从 scaffold 提升为真实续跑入口
+  - 若 `gate_3_review` 仍是 `waiting`：明确阻塞并返回 gate 信息
+  - 若 gate 已决策：
+    - 读取 `review_summary`
+    - 合并 `review_candidates / regenerate_candidates / gate reject ids`
+    - 生成 `resume_plan.json`
+    - 生成过滤后的 `resume_shot_specs.yaml`
+    - 生成新的 `resume_project.yaml`
+    - 自动拉起 follow-up run，并从 `plan` 开始续跑
+- 为原始 run 补充 resume 相关 artifact
+  - `resume_plan`
+  - `resume_shot_specs`
+  - `resume_project_file`
+- 修正 `gate` 命令细节
+  - 当未显式传入 `decision_summary` 或 `reviewer` 时，保留已有 gate 信息，不再清空
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 验证 waiting gate 会阻塞 resume：
+  - `python -m moviegen.cli resume --run-id run_20260319_223709_0f28a433 --dry-run`
+- 之后对该 gate 执行 approve/reject：
+  - approve: `candidate_0735f189f361,candidate_d1efd26aa5a0`
+  - reject: `candidate_615a5ff275ee`
+- 再运行 resume：
+  - source run: `run_20260319_223709_0f28a433`
+  - follow-up run: `run_20260319_225604_8c89c386`
+- 检查：
+  - `workspace/review/run_20260319_223709_0f28a433__resume_plan.json`
+  - `workspace/review/run_20260319_225604_8c89c386__review_summary.json`
+  - `python -m moviegen.cli status --run-id run_20260319_225604_8c89c386`
+
+### 效果
+
+- `resume` 现在不再只是提示语，而是能真实执行“按 review/gate 结果继续跑”
+- waiting gate 场景：
+  - 会明确返回 `review gate is still waiting`
+  - 不会误启动 follow-up run
+- gate 已决策场景：
+  - 会把被 reject 的 candidate 对应 shot 过滤出来
+  - 本轮验证中只续跑了 `SHOT_001`
+  - follow-up run `run_20260319_225604_8c89c386` 已真实从 `plan -> report` 跑完
+- `gate` 命令保留摘要修复也已验证：
+  - `decision_summary` 在后续 approve 时仍能保留原值 `1 candidates require manual review.`
+
+### 问题
+
+- 当前 `resume` 仍是“shot 级 rerun”，不是更细的 packet/job 级 rerun
+- `follow-up run` 仍会重新走 `generate/judge/review`，但还不会消费 `approved_candidates` 去推进到 `post/assemble`
+
+### 下一步
+
+- 让 `resume` 对 `approved_candidates` 和 `approved gate` 也能继续向后推进
+- 或者把 `post` 从 placeholder 提升为真正的后处理/交付前阶段
