@@ -489,6 +489,19 @@ def evaluate_media_gate(media_probe: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compute_next_release_version(root: Path, project_id: str) -> str:
+    release_root = root / "workspace" / "release"
+    pattern = re.compile(rf"^{re.escape(project_id)}__v(\d{{3}})(?:__.*)?$")
+    max_version = 0
+    if release_root.exists():
+        for path in release_root.iterdir():
+            match = pattern.match(path.stem if path.is_file() else path.name)
+            if not match:
+                continue
+            max_version = max(max_version, int(match.group(1)))
+    return f"v{max_version + 1:03d}"
+
+
 def build_live_submission_attempts(spec: ProjectSpec, shot_jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not shot_jobs:
         return []
@@ -2094,7 +2107,9 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     write_json(json_out, payload)
     md_out.write_text(markdown, encoding="utf-8")
 
-    release_dir = ctx.root / "workspace" / "release" / ctx.run_id
+    release_version = compute_next_release_version(ctx.root, spec.project.id)
+    release_name = f"{spec.project.id}__{release_version}__{ctx.run_id}"
+    release_dir = ctx.root / "workspace" / "release" / release_name
     release_media_dir = release_dir / "media"
     release_docs_dir = release_dir / "docs"
     release_media_dir.mkdir(parents=True, exist_ok=True)
@@ -2183,32 +2198,40 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         "checksums_manifest_id": f"checksums_{uuid4().hex[:12]}",
         "run_id": ctx.run_id,
         "release_dir": str(release_dir),
+        "release_name": release_name,
+        "release_version": release_version,
         "entries": checksum_entries,
         "created_at": now_iso(),
     }
-    checksums_manifest_path = ctx.root / "workspace" / "release" / f"{ctx.run_id}__checksums.json"
+    checksums_manifest_path = ctx.root / "workspace" / "release" / f"{release_name}__checksums.json"
     write_json(checksums_manifest_path, checksums_manifest)
+    checksums_txt_path = ctx.root / "workspace" / "release" / f"{release_name}.sha256"
+    checksums_lines = [f"{entry['sha256']} *{entry['relative_path']}" for entry in checksum_entries]
+    checksums_txt_path.write_text("\n".join(checksums_lines) + ("\n" if checksums_lines else ""), encoding="utf-8")
 
-    zip_path = ctx.root / "workspace" / "release" / f"{ctx.run_id}.zip"
+    zip_path = ctx.root / "workspace" / "release" / f"{release_name}.zip"
     with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(p for p in release_dir.rglob("*") if p.is_file()):
-            arcname = f"{ctx.run_id}/{str(path.relative_to(release_dir)).replace('\\', '/')}"
+            arcname = f"{release_name}/{str(path.relative_to(release_dir)).replace('\\', '/')}"
             archive.write(path, arcname=arcname)
     zip_sha256 = sha256_file(zip_path)
     payload["release_export"] = {
+        "release_name": release_name,
+        "release_version": release_version,
         "release_dir": str(release_dir),
         "exported_media_count": len(exported_media),
         "copied_docs_count": len(copied_docs),
         "blocked_items_count": len(blocked_items) + len(export_blocked_items),
         "release_manifest_path": str(release_manifest_path),
         "checksums_manifest_path": str(checksums_manifest_path),
+        "checksums_text_path": str(checksums_txt_path),
         "zip_path": str(zip_path),
         "zip_sha256": zip_sha256,
     }
     payload["next_actions"] = (
-        [f"Review exported release directory: {release_dir}", f"Validate checksums via {checksums_manifest_path}", f"Distribute archive: {zip_path}"]
+        [f"Review exported release directory: {release_dir}", f"Validate checksums via {checksums_manifest_path}", f"Use text checksums: {checksums_txt_path}", f"Distribute archive: {zip_path}"]
         if exported_media and not (blocked_items or export_blocked_items)
-        else [f"Review partial export in: {release_dir}", f"Inspect checksum manifest: {checksums_manifest_path}", "Resolve blocked export items before delivery."]
+        else [f"Review partial export in: {release_dir}", f"Inspect checksum manifest: {checksums_manifest_path}", f"Inspect text checksums: {checksums_txt_path}", "Resolve blocked export items before delivery."]
         if exported_media
         else ["No media was exported; resolve blocked items first."]
     )
@@ -2224,11 +2247,14 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         [
             "",
             "## Release Export",
+            f"- Release Name: `{release_name}`",
+            f"- Release Version: `{release_version}`",
             f"- Release Dir: `{release_dir}`",
             f"- Exported Media: `{len(exported_media)}`",
             f"- Copied Docs: `{len(copied_docs)}`",
             f"- Blocked Export Items: `{len(blocked_items) + len(export_blocked_items)}`",
             f"- Checksum Manifest: `{checksums_manifest_path}`",
+            f"- Checksum Text: `{checksums_txt_path}`",
             f"- Zip Archive: `{zip_path}`",
             f"- Zip SHA256: `{zip_sha256}`",
         ]
@@ -2238,6 +2264,7 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     ctx.record_artifact(path=md_out, artifact_type="delivery_report_markdown", source_stage=Stage.REPORT.value)
     ctx.record_artifact(path=release_manifest_path, artifact_type="release_manifest", source_stage=Stage.REPORT.value)
     ctx.record_artifact(path=checksums_manifest_path, artifact_type="release_checksums", source_stage=Stage.REPORT.value)
+    ctx.record_artifact(path=checksums_txt_path, artifact_type="release_checksums_text", source_stage=Stage.REPORT.value)
     ctx.record_artifact(path=zip_path, artifact_type="release_zip_archive", source_stage=Stage.REPORT.value)
     for item in exported_media:
         exported_path = Path(item["exported_media_path"])

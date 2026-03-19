@@ -1445,3 +1445,66 @@
   - `.sha256` 文本校验文件
   - versioned release naming
   - 或真正的 post-processing 阶段
+
+## 2026-03-19 Round 29
+
+### 改动
+
+- 为 release/export 增加版本化命名
+  - 规则：`<project_id>__vNNN__<run_id>`
+  - 当前按 `workspace/release/` 下已有同项目 release 自动递增版本号
+- 增加 `.sha256` 文本校验文件
+  - 路径：`workspace/release/<release_name>.sha256`
+  - 内容格式：`<sha256> *<relative_path>`
+- 扩展 `delivery_report.json`
+  - 新增：
+    - `release_export.release_name`
+    - `release_export.release_version`
+    - `release_export.checksums_text_path`
+- 扩展 `delivery_report.md`
+  - `Release Export` 小节新增：
+    - release name
+    - release version
+    - checksum text path
+- zip 包现在也按 versioned release name 命名
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 再跑一轮 post -> report：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260319_232940_54e9c3f3`
+- 检查：
+  - `workspace/reports/run_20260319_232940_54e9c3f3__delivery_report.json`
+  - `workspace/release/moviegen_scifi_001__v001__run_20260319_232940_54e9c3f3.sha256`
+  - `workspace/release/moviegen_scifi_001__v001__run_20260319_232940_54e9c3f3.zip`
+  - `status --run-id run_20260319_232940_54e9c3f3`
+
+### 效果
+
+- release/export 现在形成更完整的交付集合：
+  - versioned release dir
+  - release manifest
+  - JSON checksums manifest
+  - `.sha256` 文本校验文件
+  - zip 包
+- `run_20260319_232940_54e9c3f3` 中：
+  - `release_name = moviegen_scifi_001__v001__run_20260319_232940_54e9c3f3`
+  - `release_version = v001`
+  - `zip_sha256 = 865272b74a34a83c33473222e965648382cb7f3818762f1c9389ae9cc4f48bc8`
+- `.sha256` 文本已经真实列出 release 目录内每个文件的 sha256
+- `delivery_report.next_actions` 现在会同时指向：
+  - versioned release dir
+  - checksums json
+  - checksums text
+  - zip 包
+
+### 问题
+
+- 当前版本号是基于本地 release 目录扫描递增，适合单机工作流，但还不是跨机器共享的版本源
+- `.sha256` 文本当前只覆盖 release 目录内容，不额外列 zip 本身；如果后续交付端有需要，可以再补 zip 的单独校验文件
+
+### 下一步
+
+- 如果继续推进，最自然的是再补一个 `zip.sha256` 单文件
+- 或者开始进入真正的 `post` 媒体后处理实现
