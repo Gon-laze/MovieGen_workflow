@@ -1688,3 +1688,27 @@
 
 - 如果继续推进，最自然的是验证并固化真实 ffmpeg 模板
 - 或者给 zip 再补一个单独的 zip 校验文件
+
+## 2026-03-20 Round 33
+
+### 验证结论
+
+- 运行 `python -m moviegen.cli doctor`
+  - 当前环境明确为：
+    - `ffmpeg = false`
+    - `ffprobe = false`
+- 运行 post -> report 链路：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260320_000237_9735e324`
+- 结果确认：
+  - `post_processing_template = normalize_h264_faststart`
+  - `post_processing_mode = file_copy_fallback:normalize_h264_faststart`
+  - `post_jobs = 2`
+  - 2 个 processed media、2 组 probe、2 组 gate 全部落盘
+  - assemble/release 已成功改为引用 `workspace/post/processed/...`
+
+### 当前判断
+
+- `post` 的模板化处理策略已经落地并可运行
+- 当前限制点不在工程流本身，而在本机缺少 `ffmpeg/ffprobe`
+- 进入有 `ffmpeg` 的环境后，下一步就应该直接验证真实 remux/transcode 分支，而不是再补工作流壳层
