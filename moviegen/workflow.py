@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import numpy as np
 import yaml
+import imageio.v2 as imageio
 from PIL import Image
 
 from .models import ORDERED_STAGES, ProjectSpec, Stage
@@ -1658,28 +1659,49 @@ def classify_image_path(path: Path) -> bool:
     return path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
 
 
-def resolve_existing_image_paths(root: Path, refs: list[str]) -> list[Path]:
+def classify_visual_ref_path(path: Path) -> bool:
+    return path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".webm", ".mkv"}
+
+
+def resolve_existing_visual_ref_paths(root: Path, refs: list[str]) -> list[Path]:
     paths: list[Path] = []
     for ref in refs:
         candidate = Path(ref)
         if not candidate.is_absolute():
             candidate = root / candidate
-        if candidate.exists() and candidate.is_file() and classify_image_path(candidate):
+        if candidate.exists() and candidate.is_file() and classify_visual_ref_path(candidate):
             paths.append(candidate)
     return paths
 
 
+def load_visual_ref_image(path: Path) -> Image.Image | None:
+    try:
+        if classify_image_path(path):
+            with Image.open(path) as img:
+                return img.convert("RGB")
+        frames = imageio.mimread(path, memtest=False)
+        if not frames:
+            return None
+        frame = frames[0]
+        return Image.fromarray(frame).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def compute_image_signature(path: Path) -> dict[str, Any] | None:
     try:
-        with Image.open(path) as img:
-            rgb = img.convert("RGB").resize((32, 32))
-            gray = img.convert("L").resize((8, 8))
-            gray_arr = np.asarray(gray, dtype=np.float32)
-            rgb_arr = np.asarray(rgb, dtype=np.float32)
+        loaded = load_visual_ref_image(path)
+        if loaded is None:
+            return None
+        rgb = loaded.resize((32, 32))
+        gray = loaded.convert("L").resize((8, 8))
+        gray_arr = np.asarray(gray, dtype=np.float32)
+        rgb_arr = np.asarray(rgb, dtype=np.float32)
         mean = float(gray_arr.mean())
         bits = (gray_arr > mean).astype(np.uint8).flatten().tolist()
         return {
             "path": str(path),
+            "source_type": "image" if classify_image_path(path) else "video_frame",
             "hash_bits": bits,
             "mean_rgb": rgb_arr.mean(axis=(0, 1)).round(3).tolist(),
             "width": int(rgb_arr.shape[1]),
@@ -1708,22 +1730,23 @@ def build_visual_continuity_report(root: Path, shot_specs: list[dict[str, Any]])
 
     for shot in shot_specs:
         shot_id = str(shot["shot_id"])
-        refs = normalize_str_list(((shot.get("references", {}) or {}).get("image_refs")))
-        image_paths = resolve_existing_image_paths(root, refs)
-        if not image_paths:
+        references = shot.get("references", {}) or {}
+        refs = normalize_str_list(references.get("image_refs")) + normalize_str_list(references.get("video_refs"))
+        visual_paths = resolve_existing_visual_ref_paths(root, refs)
+        if not visual_paths:
             skipped_shots.append(
                 {
                     "shot_id": shot_id,
-                    "reason": "missing_image_refs",
+                    "reason": "missing_visual_refs",
                 }
             )
             continue
-        signatures = [signature for signature in (compute_image_signature(path) for path in image_paths) if signature]
+        signatures = [signature for signature in (compute_image_signature(path) for path in visual_paths) if signature]
         if not signatures:
             skipped_shots.append(
                 {
                     "shot_id": shot_id,
-                    "reason": "image_signature_failed",
+                    "reason": "visual_signature_failed",
                 }
             )
             continue
@@ -1800,11 +1823,13 @@ def build_visual_continuity_report(root: Path, shot_specs: list[dict[str, Any]])
 
     return {
         "available_shot_images": len(shot_images),
+        "available_shot_visual_refs": len(shot_images),
         "pairwise_checks": pairwise_checks,
         "issues": issues,
         "skipped_shots": skipped_shots,
         "counts": {
             "shots_with_images": len(shot_images),
+            "shots_with_visual_refs": len(shot_images),
             "pairwise_checks": len(pairwise_checks),
             "issues": len(issues),
             "skipped_shots": len(skipped_shots),

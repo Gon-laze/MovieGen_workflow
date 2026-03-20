@@ -2124,3 +2124,62 @@
 
 - 如果继续推进，最自然的是做视频帧级 visual continuity 检查
 - 或者把视觉 continuity 风险继续接到 rerun/provider reroute 逻辑里
+
+## 2026-03-21 Round 42
+
+### 改动
+
+- 把视觉级 continuity 检查从“只支持 image_refs”扩展到“同时支持 image_refs + video_refs”
+- 新增视觉参考解析：
+  - 静态图片：`png/jpg/jpeg/webp`
+  - 视频参考：`gif/mp4/mov/webm/mkv`
+- 对视频参考的当前实现：
+  - 提取首帧/代表帧做视觉签名
+- 视觉签名现在结合：
+  - 灰度平均 hash bits
+  - `mean_rgb`
+  - `color_distance`
+- 视觉问题判断阈值已从单一 hash 比较升级为：
+  - `hash distance`
+  - 或 `color_distance`
+- continuity 输出中新增/补强：
+  - `available_shot_visual_refs`
+  - `shots_with_visual_refs`
+  - `pairwise_checks[].color_distance`
+
+### 验证
+
+- 默认配置 run：`run_20260321_000755_f90695ea`
+  - 无视觉参考时，`visual_checks.skipped_shots = 3`
+- 强对比 `image_refs` 样例 run：`run_20260321_001111_c8dc98b3`
+  - 成功识别 `visual_character_similarity_low` 与 `visual_sequence_similarity_low`
+- 强对比 `video_refs` 样例 run：`run_20260321_001502_555bd4eb`
+  - 使用 `tmp/visual_video_refs/char_video_dark.gif`
+  - 使用 `tmp/visual_video_refs/char_video_bright.gif`
+  - 成功识别同样的视觉连续性问题
+- 检查：
+  - `workspace/review/run_20260321_001502_555bd4eb__continuity_report.json`
+  - `workspace/review/run_20260321_001502_555bd4eb__review_summary.json`
+  - `status --run-id run_20260321_001502_555bd4eb`
+
+### 效果
+
+- 视觉级 continuity 检查现在已经不局限于单张参考图，视频参考也能参与
+- 在 `run_20260321_001502_555bd4eb` 中：
+  - `visual_issue_count = 2`
+  - `available_shot_visual_refs = 2`
+  - `pairwise_checks[0].color_distance = 381.051`
+- 对应 review 分流也已真实受影响：
+  - `review_candidates = 2`
+  - `approved_candidates = 0`
+  - `decision_reasons` 含 `continuity_issue:visual_*`
+
+### 问题
+
+- 当前视频参考仍只取首帧/代表帧，不是多帧时间序列连续性比较
+- `gif` 路径已验证可用，但真实 `mp4/mov` 在无 ffmpeg 环境下仍受限于本地解码能力
+
+### 下一步
+
+- 如果继续推进，最自然的是做多帧 video continuity
+- 或把视觉 continuity 风险继续接到 rerun/provider reroute 逻辑中
