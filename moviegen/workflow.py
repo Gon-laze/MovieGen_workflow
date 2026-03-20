@@ -1830,6 +1830,15 @@ def build_continuity_report(
     }
 
 
+def build_continuity_issue_index(continuity_report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = {}
+    for issue in continuity_report.get("issues", []) or []:
+        scope_id = str(issue.get("scope_id") or "")
+        if scope_id:
+            index.setdefault(scope_id, []).append(issue)
+    return index
+
+
 def resolve_existing_file_path(value: Any) -> Path | None:
     if value in {None, ""}:
         return None
@@ -1999,6 +2008,66 @@ def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         else:
             approved_candidates.append(record)
 
+    continuity_report = build_continuity_report(
+        run_id=ctx.run_id,
+        shot_specs=shot_specs,
+        review_records=review_candidates + regenerate_candidates + approved_candidates,
+    )
+    continuity_issue_index = build_continuity_issue_index(continuity_report)
+
+    def apply_continuity_review_policy(record: dict[str, Any]) -> dict[str, Any]:
+        shot_id = str(record["shot_id"])
+        shot_issues = list(continuity_issue_index.get(shot_id, []))
+        sequence_id = next((str(shot.get("sequence_id") or "") for shot in shot_specs if str(shot.get("shot_id")) == shot_id), "")
+        character_ids = []
+        for shot in shot_specs:
+            if str(shot.get("shot_id")) != shot_id:
+                continue
+            continuity = shot.get("continuity", {}) or {}
+            character_ids = normalize_str_list(continuity.get("character_ids"))
+            break
+        for issue in continuity_issue_index.get(sequence_id, []):
+            if issue not in shot_issues:
+                shot_issues.append(issue)
+        for character_id in character_ids:
+            for issue in continuity_issue_index.get(character_id, []):
+                if issue not in shot_issues:
+                    shot_issues.append(issue)
+
+        if not shot_issues:
+            return record
+
+        issue_types = sorted({str(issue.get("issue_type")) for issue in shot_issues})
+        decision_reasons = list(record.get("decision_reasons", []))
+        decision_reasons.extend(f"continuity_issue:{issue_type}" for issue_type in issue_types)
+        record["decision_reasons"] = decision_reasons
+        record["continuity_issue_types"] = issue_types
+        record["continuity_issue_count"] = len(shot_issues)
+
+        severe_types = {"character_provider_mixture", "sequence_provider_mixture"}
+        if any(issue_type in severe_types for issue_type in issue_types):
+            record["decision"] = "review"
+            record["route_back_stage"] = "review"
+        if len(shot_issues) >= 4 and not record.get("hard_fail", False):
+            record["decision"] = "regenerate_same_provider"
+            record["route_back_stage"] = "generate"
+            record["hard_fail"] = True
+            hard_fail_reasons = list(record.get("hard_fail_reasons", []))
+            hard_fail_reasons.append("continuity_issue_threshold")
+            record["hard_fail_reasons"] = hard_fail_reasons
+        return record
+
+    review_candidates = [apply_continuity_review_policy(dict(item)) for item in review_candidates]
+    regenerate_candidates = [apply_continuity_review_policy(dict(item)) for item in regenerate_candidates]
+    approved_candidates = [apply_continuity_review_policy(dict(item)) for item in approved_candidates]
+
+    review_candidates.extend([item for item in approved_candidates if item.get("decision") == "review"])
+    regenerate_candidates.extend([item for item in approved_candidates if item.get("decision") == "regenerate_same_provider"])
+    approved_candidates = [
+        item
+        for item in approved_candidates
+        if item.get("decision") not in {"review", "regenerate_same_provider"}
+    ]
     gate_status = "approved"
     gate_summary = "No manual review queue was created."
     if review_candidates:
@@ -2048,11 +2117,6 @@ def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         ),
         "created_at": now_iso(),
     }
-    continuity_report = build_continuity_report(
-        run_id=ctx.run_id,
-        shot_specs=shot_specs,
-        review_records=review_candidates + regenerate_candidates + approved_candidates,
-    )
     payload["continuity_summary"] = {
         "issue_count": continuity_report["counts"]["issues"],
         "sequence_count": continuity_report["counts"]["sequences"],
