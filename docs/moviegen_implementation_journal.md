@@ -1832,3 +1832,64 @@
 
 - 如果继续推进，最自然的是补视觉级 continuity 检查
 - 或者把 continuity 风险进一步接到 `generate` 的 provider/router 回流策略里
+
+## 2026-03-20 Round 36
+
+### 改动
+
+- 把 continuity 风险真正接入 `review` 分流，而不只是单独出报告
+- 新增 continuity issue 索引：
+  - 按 `shot_id`
+  - 按 `sequence_id`
+  - 按 `character_id`
+- 为每个 review candidate 增加 continuity 风险策略：
+  - 命中严重 continuity 类型时：
+    - `decision = review`
+    - `route_back_stage = review`
+  - 命中 continuity issue 数达到阈值时：
+    - `decision = regenerate_same_provider`
+    - `route_back_stage = generate`
+    - `hard_fail = true`
+- 每个受影响的 candidate 现在会写入：
+  - `continuity_issue_types`
+  - `continuity_issue_count`
+  - `decision_reasons += continuity_issue:*`
+  - 必要时 `hard_fail_reasons += continuity_issue_threshold`
+- 修正 review 统计顺序
+  - continuity 改写后再计算 gate/payload/counts
+  - 避免摘要与最终 candidate 分桶不一致
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 运行默认全链路 dry-run：
+  - `python -m moviegen.cli run config/project.example.yaml --stage all --dry-run`
+  - run_id: `run_20260320_234927_21968fc9`
+- 检查：
+  - `workspace/review/run_20260320_234927_21968fc9__review_summary.json`
+  - `workspace/review/run_20260320_234927_21968fc9__continuity_report.json`
+  - `workspace/reports/run_20260320_234927_21968fc9__delivery_report.json`
+  - `status --run-id run_20260320_234927_21968fc9`
+
+### 效果
+
+- continuity 现在已经不只是“看报告”，而是会真实改写候选去向
+- 在 `run_20260320_234927_21968fc9` 中：
+  - `review_candidates = 4`
+  - `regenerate_candidates = 2`
+  - `approved_candidates = 0`
+- 原本通过的两个候选已被 continuity 风险推入 regenerate：
+  - `SHOT_001` 高分 `seedance_2_0`
+  - `SHOT_002` 高分 `kling_3_0`
+- `gate_3_review` 的 payload 和 counts 已与 continuity 改写后的结果对齐
+- `delivery_report` 也已反映 continuity 风险导致的 blocked items
+
+### 问题
+
+- continuity 风险模型当前仍是规则式，不是视觉级人物/服装/场景漂移检测
+- 阈值和 severe 类型仍属工程启发式，后续应结合真实图像特征继续调优
+
+### 下一步
+
+- 如果继续推进，最自然的是把 continuity 风险继续接到 router/provider 约束上
+- 或者开始补视觉级 continuity 检查
