@@ -2009,3 +2009,30 @@
 
 - 如果继续推进，最自然的是补视觉级 continuity 检查
 - 或者把 continuity reroute 进一步接进 live generate fallback 逻辑
+
+## 2026-03-20 Round 39
+
+### 验证结论
+
+- continuity reroute 已真实打通到 rerun 执行层
+- 对 source run `run_20260320_234927_21968fc9`：
+  - gate 置为 `approved` 后执行 `resume --dry-run`
+  - 生成 follow-up rerun: `run_20260320_235924_29f5227e`
+- 本轮关键确认点：
+  - `resume` 终端输出已包含 `continuity_reroutes`
+  - `resume_plan.json` 已真实落盘 `continuity_reroutes`
+  - `resume_shot_specs.yaml` 中已把 `SHOT_001`、`SHOT_002` 收敛为：
+    - `allowed_providers = [seedance_2_0]`
+  - `route_plan.json` 中已真实只生成 `seedance_2_0` job
+  - `selected_reason` 已显示 `continuity_reroute:seedance_2_0`
+
+### 当前判断
+
+- continuity 风险现在已经形成闭环：
+  - `continuity_report` 识别问题
+  - `review` 改写候选去向
+  - `resume` 写入 rerun provider constraints
+  - `route` 按约束执行
+- 当前下一步如果继续推进，不应再补工程壳层，而应进入：
+  - 视觉级 continuity 检查
+  - 或 continuity-aware live fallback
