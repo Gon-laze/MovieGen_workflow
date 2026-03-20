@@ -467,20 +467,7 @@ def resume(
         "created_at": now_iso(),
     }
     resume_plan_path = root / "workspace" / "review" / f"{run_id}__resume_plan.json"
-    resume_plan_path.write_text(json.dumps(resume_plan, ensure_ascii=False, indent=2), encoding="utf-8")
-    insert_artifact(
-        conn,
-        artifact_id=f"artifact_{uuid4().hex[:12]}",
-        run_id=run_id,
-        artifact_type="resume_plan",
-        artifact_path=str(resume_plan_path),
-        source_stage="review",
-        source_id=run_id,
-        content_hash=sha256_file(resume_plan_path),
-        file_size_bytes=resume_plan_path.stat().st_size,
-        retention_policy="keep",
-        created_at=now_iso(),
-    )
+    resume_plan_artifact_id = f"artifact_{uuid4().hex[:12]}"
 
     source_project_file = Path(str(row["project_file"]))
     if not source_project_file.is_absolute():
@@ -685,6 +672,20 @@ def resume(
         )
 
     if not followup_payloads:
+        resume_plan_path.write_text(json.dumps(resume_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        insert_artifact(
+            conn,
+            artifact_id=resume_plan_artifact_id,
+            run_id=run_id,
+            artifact_type="resume_plan",
+            artifact_path=str(resume_plan_path),
+            source_stage="review",
+            source_id=run_id,
+            content_hash=sha256_file(resume_plan_path),
+            file_size_bytes=resume_plan_path.stat().st_size,
+            retention_policy="keep",
+            created_at=now_iso(),
+        )
         typer.echo(
             json.dumps(
                 {
@@ -699,6 +700,20 @@ def resume(
         )
         return
 
+    resume_plan_path.write_text(json.dumps(resume_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    insert_artifact(
+        conn,
+        artifact_id=resume_plan_artifact_id,
+        run_id=run_id,
+        artifact_type="resume_plan",
+        artifact_path=str(resume_plan_path),
+        source_stage="review",
+        source_id=run_id,
+        content_hash=sha256_file(resume_plan_path),
+        file_size_bytes=resume_plan_path.stat().st_size,
+        retention_policy="keep",
+        created_at=now_iso(),
+    )
     typer.echo(
         json.dumps(
             {
@@ -707,6 +722,7 @@ def resume(
                 **followup_payloads,
                 "rerun_shot_ids": rerun_shot_ids,
                 "approved_candidate_ids": sorted(approved_candidate_ids),
+                "continuity_reroutes": resume_plan.get("continuity_reroutes", []),
             },
             ensure_ascii=False,
             indent=2,
