@@ -2245,3 +2245,67 @@
 
 - 如果继续推进，最自然的是把视觉 continuity 风险继续接到 rerun/provider reroute
 - 或进一步做更密集的视频时序 continuity 检查
+
+## 2026-03-21 Round 44
+
+### 改动
+
+- 把视频参考的视觉连续性检查从“单帧”升级为“多帧”
+- 当前对 `video_refs` 的采样策略：
+  - 首帧
+  - 中间帧
+  - 末帧
+- pairwise 结果现在会同时输出：
+  - `min_distance`
+  - `min_color_distance`
+  - `max_distance`
+  - `max_color_distance`
+  - `avg_distance`
+  - `avg_color_distance`
+  - `best_left_frame_index`
+  - `best_right_frame_index`
+  - 全量 `comparisons`
+- 视觉问题判定现在使用“最大差异”而不是“最佳匹配”
+  - 避免“首帧一样但后续帧分叉”被漏掉
+
+### 验证
+
+- 构造多帧视频参考样例：
+  - `tmp/visual_video_refs_multiframe/char_video_samefirst_black.gif`
+  - `tmp/visual_video_refs_multiframe/char_video_samefirst_white.gif`
+  - 两者首帧相同，后续帧分别变成黑/白
+- 运行：
+  - `python -m moviegen.cli run tmp/visual_multiframe_project.yaml --stage all --dry-run`
+  - run_id: `run_20260321_001842_b607611f`
+- 检查：
+  - `workspace/review/run_20260321_001842_b607611f__continuity_report.json`
+  - `workspace/review/run_20260321_001842_b607611f__review_summary.json`
+  - `status --run-id run_20260321_001842_b607611f`
+
+### 效果
+
+- 多帧 video continuity 现在已经生效
+- 在 `run_20260321_001842_b607611f` 中：
+  - `min_distance = 0`
+  - `min_color_distance = 0.0`
+  - `max_color_distance = 441.673`
+  - `avg_color_distance = 220.837`
+- 这说明系统已经能识别：
+  - 首帧相同
+  - 但后续代表帧显著分叉
+- 对应视觉连续性问题已真实触发：
+  - `visual_character_similarity_low`
+  - `visual_sequence_similarity_low`
+- review 分流也已真实受影响：
+  - `review_candidates = 2`
+  - `approved_candidates = 0`
+
+### 问题
+
+- 当前仍是“少量代表帧”策略，不是稠密时序比较
+- 对长视频更精细的时间连续性，后续还可继续提升
+
+### 下一步
+
+- 如果继续推进，最自然的是把视觉连续性风险也接到 rerun/provider reroute
+- 或进一步做更密集的视频时序 continuity 检查
