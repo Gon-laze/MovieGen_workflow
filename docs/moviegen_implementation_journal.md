@@ -2036,3 +2036,27 @@
 - 当前下一步如果继续推进，不应再补工程壳层，而应进入：
   - 视觉级 continuity 检查
   - 或 continuity-aware live fallback
+
+## 2026-03-20 Round 40
+
+### 修复与验证
+
+- 修复 `resume` 中一个真实问题：
+  - `resume_plan.json` 之前写入时机过早，导致 `continuity_reroutes` 终端有、文件里没有
+  - 现在已在 follow-up 计划成型后再统一落盘
+- 再次验证 continuity-aware rerun：
+  - source run: `run_20260320_234927_21968fc9`
+  - rerun follow-up: `run_20260320_235924_29f5227e`
+- 关键确认点全部成立：
+  - `workspace/review/run_20260320_234927_21968fc9__resume_plan.json` 已真实包含 `continuity_reroutes`
+  - `workspace/review/run_20260320_235924_29f5227e__resume_shot_specs.yaml` 已真实把 `SHOT_001`、`SHOT_002` 收敛到 `allowed_providers = [seedance_2_0]`
+  - `workspace/reports/run_20260320_235924_29f5227e__route_plan.json` 已真实显示：
+    - `selected_reason = continuity_reroute:seedance_2_0`
+    - `fallback_chain = [seedance_2_0]`
+
+### 当前判断
+
+- continuity 风险现在已经真正贯通到 rerun 执行层，而不只是 review 说明层
+- 当前如果继续推进，最自然的下一步是：
+  - 视觉级 continuity 检查
+  - 或 continuity-aware live fallback
