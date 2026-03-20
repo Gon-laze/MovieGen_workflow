@@ -1712,3 +1712,62 @@
 - `post` 的模板化处理策略已经落地并可运行
 - 当前限制点不在工程流本身，而在本机缺少 `ffmpeg/ffprobe`
 - 进入有 `ffmpeg` 的环境后，下一步就应该直接验证真实 remux/transcode 分支，而不是再补工作流壳层
+
+## 2026-03-20 Round 34
+
+### 改动
+
+- 新增最小可用 `Continuity Checker`
+  - 在 `review` 阶段生成独立 `continuity_report.json`
+  - 覆盖三个视角：
+    - `shot_contexts`
+    - `sequence_summaries`
+    - `character_summaries`
+- 连续性问题目前会检测并输出：
+  - `shot_provider_mixture`
+  - `sequence_provider_mixture`
+  - `sequence_decision_divergence`
+  - `character_provider_mixture`
+  - 以及缺失 continuity 字段的基础问题
+- `review_summary` 现在会附带 `continuity_summary`
+- `report` 现在会引用 `source_continuity_report`，并把 `continuity_issues` 写入 counts
+- 修正 `post` 空媒体路径问题
+  - 之前 `media_artifact_path` 为空时，会把 `.` 当作路径，导致 `Permission denied: '.'`
+  - 现在会正确落为 `missing_source_media`
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 运行默认全链路 dry-run：
+  - `python -m moviegen.cli run config/project.example.yaml --stage all --dry-run`
+  - run_id: `run_20260320_234508_9fa4fd3b`
+- 检查：
+  - `workspace/review/run_20260320_234508_9fa4fd3b__continuity_report.json`
+  - `workspace/review/run_20260320_234508_9fa4fd3b__review_summary.json`
+  - `workspace/reports/run_20260320_234508_9fa4fd3b__delivery_report.json`
+  - `status --run-id run_20260320_234508_9fa4fd3b`
+
+### 效果
+
+- `Continuity Checker` 已真实落地
+  - 当前示例 run 检出 `issues = 7`
+  - 并能指出：
+    - 同 shot 多 provider 候选
+    - 同 sequence provider 混用
+    - 同 sequence 决策分裂
+    - 同角色跨镜头 provider 混用
+- `review_summary` 已带 `continuity_summary`
+- `delivery_report` 已能统计 `continuity_issues = 7`
+- `post` 的空路径 bug 已修正
+  - 当前会正确输出 `missing_source_media`
+  - 不会再误报 `Permission denied: '.'`
+
+### 问题
+
+- 当前连续性检查仍是规则式预警，不是视觉级一致性判定
+- 还没有基于真实图像内容做人物脸部/服装/场景漂移检测
+
+### 下一步
+
+- 如果继续推进，最自然的是把 continuity 风险真正接入 `review` 决策
+- 或者补更强的视觉级 continuity 检查

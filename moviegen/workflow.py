@@ -1630,6 +1630,217 @@ def apply_media_gate_decision(candidate: dict[str, Any], evaluation: dict[str, A
     return evaluation
 
 
+def normalize_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in {None, ""}]
+    if value in {"", None}:
+        return []
+    return [str(value)]
+
+
+def build_continuity_report(
+    *,
+    run_id: str,
+    shot_specs: list[dict[str, Any]],
+    review_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    shot_meta: dict[str, dict[str, Any]] = {}
+    for shot in shot_specs:
+        continuity = shot.get("continuity", {}) or {}
+        shot_meta[str(shot["shot_id"])] = {
+            "shot_id": str(shot["shot_id"]),
+            "sequence_id": str(shot.get("sequence_id") or "unknown_sequence"),
+            "scene_id": str(shot.get("scene_id") or "unknown_scene"),
+            "character_ids": normalize_str_list(continuity.get("character_ids")),
+            "wardrobe_ids": normalize_str_list(continuity.get("wardrobe_ids")),
+            "location_id": str(continuity.get("location_id") or ""),
+            "prop_ids": normalize_str_list(continuity.get("prop_ids")),
+            "archetype": shot.get("archetype"),
+            "grade": shot.get("grade"),
+        }
+
+    shot_decisions: dict[str, list[dict[str, Any]]] = {}
+    for record in review_records:
+        shot_decisions.setdefault(str(record["shot_id"]), []).append(record)
+
+    issues: list[dict[str, Any]] = []
+    sequence_index: dict[str, list[dict[str, Any]]] = {}
+    character_index: dict[str, list[dict[str, Any]]] = {}
+    shot_contexts: list[dict[str, Any]] = []
+
+    for shot_id, meta in shot_meta.items():
+        decisions = shot_decisions.get(shot_id, [])
+        providers = sorted({str(item.get("provider")) for item in decisions if item.get("provider")})
+        decision_types = sorted({str(item.get("decision")) for item in decisions if item.get("decision")})
+        shot_context = {
+            **meta,
+            "providers": providers,
+            "decisions": decision_types,
+            "candidate_count": len(decisions),
+        }
+        shot_contexts.append(shot_context)
+        sequence_index.setdefault(meta["sequence_id"], []).append(shot_context)
+        for character_id in meta["character_ids"]:
+            character_index.setdefault(character_id, []).append(shot_context)
+
+        if not meta["character_ids"]:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "shot",
+                    "scope_id": shot_id,
+                    "issue_type": "missing_character_ids",
+                    "message": f"{shot_id} is missing continuity.character_ids",
+                }
+            )
+        if not meta["location_id"]:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "shot",
+                    "scope_id": shot_id,
+                    "issue_type": "missing_location_id",
+                    "message": f"{shot_id} is missing continuity.location_id",
+                }
+            )
+        if len(providers) > 1:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "shot",
+                    "scope_id": shot_id,
+                    "issue_type": "shot_provider_mixture",
+                    "message": f"{shot_id} has multiple candidate providers: {', '.join(providers)}",
+                }
+            )
+
+    sequence_summaries: list[dict[str, Any]] = []
+    for sequence_id, shots in sorted(sequence_index.items()):
+        location_ids = sorted({shot["location_id"] for shot in shots if shot["location_id"]})
+        wardrobe_ids = sorted({wardrobe_id for shot in shots for wardrobe_id in shot["wardrobe_ids"]})
+        providers = sorted({provider for shot in shots for provider in shot["providers"]})
+        decisions = sorted({decision for shot in shots for decision in shot["decisions"]})
+        summary = {
+            "sequence_id": sequence_id,
+            "shot_ids": [shot["shot_id"] for shot in shots],
+            "location_ids": location_ids,
+            "wardrobe_ids": wardrobe_ids,
+            "providers": providers,
+            "decisions": decisions,
+        }
+        sequence_summaries.append(summary)
+        if len(location_ids) > 1:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "sequence",
+                    "scope_id": sequence_id,
+                    "issue_type": "sequence_location_variation",
+                    "message": f"{sequence_id} spans multiple continuity locations: {', '.join(location_ids)}",
+                }
+            )
+        if len(wardrobe_ids) > 1:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "sequence",
+                    "scope_id": sequence_id,
+                    "issue_type": "sequence_wardrobe_variation",
+                    "message": f"{sequence_id} spans multiple wardrobe ids: {', '.join(wardrobe_ids)}",
+                }
+            )
+        if len(providers) > 1:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "sequence",
+                    "scope_id": sequence_id,
+                    "issue_type": "sequence_provider_mixture",
+                    "message": f"{sequence_id} mixes providers: {', '.join(providers)}",
+                }
+            )
+        if len(decisions) > 1:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "sequence",
+                    "scope_id": sequence_id,
+                    "issue_type": "sequence_decision_divergence",
+                    "message": f"{sequence_id} has mixed review decisions: {', '.join(decisions)}",
+                }
+            )
+
+    character_summaries: list[dict[str, Any]] = []
+    for character_id, shots in sorted(character_index.items()):
+        providers = sorted({provider for shot in shots for provider in shot["providers"]})
+        wardrobe_ids = sorted({wardrobe_id for shot in shots for wardrobe_id in shot["wardrobe_ids"]})
+        summary = {
+            "character_id": character_id,
+            "shot_ids": [shot["shot_id"] for shot in shots],
+            "providers": providers,
+            "wardrobe_ids": wardrobe_ids,
+        }
+        character_summaries.append(summary)
+        if len(providers) > 1:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "character",
+                    "scope_id": character_id,
+                    "issue_type": "character_provider_mixture",
+                    "message": f"{character_id} is represented by multiple providers: {', '.join(providers)}",
+                }
+            )
+        if len(wardrobe_ids) > 1:
+            issues.append(
+                {
+                    "issue_id": f"cont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "character",
+                    "scope_id": character_id,
+                    "issue_type": "character_wardrobe_variation",
+                    "message": f"{character_id} spans multiple wardrobe ids: {', '.join(wardrobe_ids)}",
+                }
+            )
+
+    return {
+        "continuity_id": f"continuity_{uuid4().hex[:12]}",
+        "run_id": run_id,
+        "shot_contexts": shot_contexts,
+        "sequence_summaries": sequence_summaries,
+        "character_summaries": character_summaries,
+        "issues": issues,
+        "counts": {
+            "shots": len(shot_contexts),
+            "sequences": len(sequence_summaries),
+            "characters": len(character_summaries),
+            "issues": len(issues),
+        },
+        "created_at": now_iso(),
+    }
+
+
+def resolve_existing_file_path(value: Any) -> Path | None:
+    if value in {None, ""}:
+        return None
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = Path(str(value))
+    if path.exists() and path.is_file():
+        return path
+    return None
+
+
 def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     jobs_path = ctx.root / "workspace" / "jobs" / f"{ctx.run_id}__generation_jobs.json"
     routed_jobs: list[dict[str, Any]] = []
@@ -1747,6 +1958,10 @@ def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
 
     judge_payload = json.loads(judge_path.read_text(encoding="utf-8"))
     judge_scores = judge_payload.get("judge_scores", [])
+    shot_plan_path = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__shot_plan.json"
+    shot_specs: list[dict[str, Any]] = []
+    if shot_plan_path.exists():
+        shot_specs = json.loads(shot_plan_path.read_text(encoding="utf-8")).get("shot_specs", [])
 
     candidate_dir = ctx.root / "workspace" / "candidates"
     candidate_index: dict[str, dict[str, Any]] = {}
@@ -1833,17 +2048,32 @@ def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         ),
         "created_at": now_iso(),
     }
+    continuity_report = build_continuity_report(
+        run_id=ctx.run_id,
+        shot_specs=shot_specs,
+        review_records=review_candidates + regenerate_candidates + approved_candidates,
+    )
+    payload["continuity_summary"] = {
+        "issue_count": continuity_report["counts"]["issues"],
+        "sequence_count": continuity_report["counts"]["sequences"],
+        "character_count": continuity_report["counts"]["characters"],
+        "top_issue_types": sorted({issue["issue_type"] for issue in continuity_report["issues"]}),
+    }
     out = ctx.root / "workspace" / "review" / f"{ctx.run_id}__review_summary.json"
+    continuity_out = ctx.root / "workspace" / "review" / f"{ctx.run_id}__continuity_report.json"
     write_json(out, payload)
+    write_json(continuity_out, continuity_report)
     ctx.record_artifact(path=out, artifact_type="review_report", source_stage=Stage.REVIEW.value)
+    ctx.record_artifact(path=continuity_out, artifact_type="continuity_report", source_stage=Stage.REVIEW.value)
     return StageResult(
         note=payload["note"],
-        artifacts=[out],
+        artifacts=[out, continuity_out],
         metadata={
             "review_count": len(review_candidates),
             "regenerate_count": len(regenerate_candidates),
             "approved_count": len(approved_candidates),
             "gate_status": gate_status,
+            "continuity_issue_count": continuity_report["counts"]["issues"],
         },
     )
 
@@ -1882,15 +2112,15 @@ def stage_post(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     post_jobs: list[dict[str, Any]] = []
     post_blocked_items: list[dict[str, Any]] = []
     for index, item in enumerate(sorted(approved_candidates, key=lambda entry: str(entry.get("shot_id") or "")), start=1):
-        source_media_path = Path(str(item.get("media_artifact_path") or ""))
-        if not source_media_path.exists():
+        source_media_path = resolve_existing_file_path(item.get("media_artifact_path"))
+        if source_media_path is None:
             post_blocked_items.append(
                 {
                     "candidate_clip_id": item["candidate_clip_id"],
                     "shot_id": item["shot_id"],
                     "provider": item.get("provider"),
                     "reason": "missing_source_media",
-                    "source_media_artifact_path": str(source_media_path),
+                    "source_media_artifact_path": str(item.get("media_artifact_path") or ""),
                 }
             )
             continue
@@ -2165,6 +2395,7 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     delivery_path = assemble_dir / f"{ctx.run_id}__delivery_manifest.json"
     timeline_path = assemble_dir / f"{ctx.run_id}__timeline_manifest.json"
     post_path = ctx.root / "workspace" / "post" / f"{ctx.run_id}__post_summary.json"
+    continuity_path = ctx.root / "workspace" / "review" / f"{ctx.run_id}__continuity_report.json"
 
     if not summary_path.exists() or not delivery_path.exists():
         payload = {
@@ -2185,6 +2416,7 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     delivery_manifest = json.loads(delivery_path.read_text(encoding="utf-8"))
     timeline_manifest = json.loads(timeline_path.read_text(encoding="utf-8")) if timeline_path.exists() else {"timeline_items": []}
     post_summary = json.loads(post_path.read_text(encoding="utf-8")) if post_path.exists() else {}
+    continuity_summary = json.loads(continuity_path.read_text(encoding="utf-8")) if continuity_path.exists() else {}
     gates = [row_to_dict(row) for row in fetch_human_gates(ctx.conn, ctx.run_id)]
 
     deliverables = delivery_manifest.get("delivery_items", []) or []
@@ -2197,6 +2429,7 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         "source_assembly_summary": str(summary_path),
         "source_delivery_manifest": str(delivery_path),
         "source_timeline_manifest": str(timeline_path) if timeline_path.exists() else None,
+        "source_continuity_report": str(continuity_path) if continuity_path.exists() else None,
         "source_review_gate": source_review_gate,
         "gates": gates,
         "counts": {
@@ -2204,7 +2437,9 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             "blocked_items": len(blocked_items),
             "timeline_items": len(timeline_manifest.get("timeline_items", [])),
             "post_candidates": len(post_summary.get("post_candidates", []) or []),
+            "continuity_issues": len(continuity_summary.get("issues", []) or []),
         },
+        "continuity_summary": continuity_summary.get("counts"),
         "deliverables": deliverables,
         "blocked_items": blocked_items,
         "next_actions": (
@@ -2229,6 +2464,7 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         f"- Deliverables: `{len(deliverables)}`",
         f"- Blocked Items: `{len(blocked_items)}`",
         f"- Timeline Items: `{len(timeline_manifest.get('timeline_items', []))}`",
+        f"- Continuity Issues: `{len(continuity_summary.get('issues', []) or [])}`",
     ]
     if source_review_gate:
         lines.append(f"- Source Review Gate: `{source_review_gate.get('gate_name')}` / `{source_review_gate.get('status')}`")
@@ -2307,7 +2543,7 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             )
 
     copied_docs: list[dict[str, Any]] = []
-    for source in [json_out, md_out, summary_path, delivery_path, timeline_path, post_path]:
+    for source in [json_out, md_out, summary_path, delivery_path, timeline_path, post_path, continuity_path]:
         if source is None or not Path(source).exists():
             continue
         source_path = Path(source)
