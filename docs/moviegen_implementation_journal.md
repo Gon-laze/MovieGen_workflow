@@ -2183,3 +2183,65 @@
 
 - 如果继续推进，最自然的是做多帧 video continuity
 - 或把视觉 continuity 风险继续接到 rerun/provider reroute 逻辑中
+
+## 2026-03-21 Round 43
+
+### 改动
+
+- 把视觉级 continuity 从“单帧 video ref”升级到“多帧 video ref”
+- 当前 video ref 处理方式：
+  - 对 `gif/mp4/mov/webm/mkv` 采样最多 3 个代表帧
+  - 当前默认采样：`首帧 / 中间帧 / 末帧`
+- pairwise 视觉比较现在会输出：
+  - `min_distance`
+  - `min_color_distance`
+  - `max_distance`
+  - `max_color_distance`
+  - `avg_distance`
+  - `avg_color_distance`
+  - 最佳匹配帧索引
+  - 全量 `comparisons`
+- 视觉 issue 判定现在不再只依赖单帧 hash：
+  - 会综合最大 hash 差异与最大颜色差异
+
+### 验证
+
+- 继续使用一组更严格的多帧视频参考样例：
+  - `tmp/visual_video_refs_multiframe/char_video_samefirst_black.gif`
+  - `tmp/visual_video_refs_multiframe/char_video_samefirst_white.gif`
+  - 两者首帧相同，后续帧明显不同
+- 运行：
+  - `python -m moviegen.cli run tmp/visual_multiframe_project.yaml --stage all --dry-run`
+  - run_id: `run_20260321_001842_b607611f`
+- 检查：
+  - `workspace/review/run_20260321_001842_b607611f__continuity_report.json`
+  - `workspace/review/run_20260321_001842_b607611f__review_summary.json`
+  - `status --run-id run_20260321_001842_b607611f`
+
+### 效果
+
+- 多帧 video continuity 现在已经生效，不再会被“首帧碰巧一样”掩盖
+- 在 `run_20260321_001842_b607611f` 中：
+  - `min_distance = 0`
+  - `min_color_distance = 0.0`
+  - `max_color_distance = 441.673`
+  - `avg_color_distance = 220.837`
+- 这说明系统已经能识别：
+  - 首帧相同
+  - 但后续帧明显发散
+- 对应视觉 continuity 问题已真实触发：
+  - `visual_character_similarity_low`
+  - `visual_sequence_similarity_low`
+- review 分流也已受影响：
+  - `review_candidates = 2`
+  - `approved_candidates = 0`
+
+### 问题
+
+- 当前 video continuity 仍是“少量代表帧”策略，不是稠密时序检查
+- 对真实长视频而言，后续仍可进一步引入更细的采样和更强的时间维比较
+
+### 下一步
+
+- 如果继续推进，最自然的是把视觉 continuity 风险继续接到 rerun/provider reroute
+- 或进一步做更密集的视频时序 continuity 检查

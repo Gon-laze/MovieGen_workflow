@@ -1688,9 +1688,32 @@ def load_visual_ref_image(path: Path) -> Image.Image | None:
         return None
 
 
-def compute_image_signature(path: Path) -> dict[str, Any] | None:
+def sample_visual_ref_images(path: Path, max_frames: int = 3) -> list[tuple[int, Image.Image]]:
+    loaded = load_visual_ref_image(path)
+    if loaded is not None and classify_image_path(path):
+        return [(0, loaded)]
     try:
-        loaded = load_visual_ref_image(path)
+        frames = imageio.mimread(path, memtest=False)
+        if not frames:
+            return []
+        candidate_indices = [0, len(frames) // 2, len(frames) - 1]
+        sampled: list[tuple[int, Image.Image]] = []
+        seen: set[int] = set()
+        for index in candidate_indices:
+            if index in seen or index < 0 or index >= len(frames):
+                continue
+            seen.add(index)
+            sampled.append((index, Image.fromarray(frames[index]).convert("RGB")))
+            if len(sampled) >= max_frames:
+                break
+        return sampled
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def compute_image_signature(path: Path, *, frame_index: int = 0, image: Image.Image | None = None) -> dict[str, Any] | None:
+    try:
+        loaded = image or load_visual_ref_image(path)
         if loaded is None:
             return None
         rgb = loaded.resize((32, 32))
@@ -1702,6 +1725,7 @@ def compute_image_signature(path: Path) -> dict[str, Any] | None:
         return {
             "path": str(path),
             "source_type": "image" if classify_image_path(path) else "video_frame",
+            "frame_index": frame_index,
             "hash_bits": bits,
             "mean_rgb": rgb_arr.mean(axis=(0, 1)).round(3).tolist(),
             "width": int(rgb_arr.shape[1]),
@@ -1741,7 +1765,15 @@ def build_visual_continuity_report(root: Path, shot_specs: list[dict[str, Any]])
                 }
             )
             continue
-        signatures = [signature for signature in (compute_image_signature(path) for path in visual_paths) if signature]
+        signatures: list[dict[str, Any]] = []
+        for path in visual_paths:
+            sampled_images = sample_visual_ref_images(path)
+            if not sampled_images:
+                continue
+            for frame_index, image in sampled_images:
+                signature = compute_image_signature(path, frame_index=frame_index, image=image)
+                if signature:
+                    signatures.append(signature)
         if not signatures:
             skipped_shots.append(
                 {
@@ -1767,19 +1799,39 @@ def build_visual_continuity_report(root: Path, shot_specs: list[dict[str, Any]])
             continue
         for idx, left in enumerate(entries):
             for right in entries[idx + 1 :]:
-                left_sig = left["signatures"][0]
-                right_sig = right["signatures"][0]
-                distance = hamming_distance(left_sig["hash_bits"], right_sig["hash_bits"])
+                comparisons = []
+                for left_sig in left["signatures"]:
+                    for right_sig in right["signatures"]:
+                        comparisons.append(
+                            {
+                                "left_frame_index": left_sig["frame_index"],
+                                "right_frame_index": right_sig["frame_index"],
+                                "distance": hamming_distance(left_sig["hash_bits"], right_sig["hash_bits"]),
+                                "color_distance": round(rgb_mean_distance(left_sig["mean_rgb"], right_sig["mean_rgb"]), 3),
+                            }
+                        )
+                best = min(comparisons, key=lambda item: (item["distance"], item["color_distance"]))
+                max_distance = max(item["distance"] for item in comparisons)
+                max_color_distance = max(item["color_distance"] for item in comparisons)
+                avg_distance = round(sum(item["distance"] for item in comparisons) / len(comparisons), 3)
+                avg_color_distance = round(sum(item["color_distance"] for item in comparisons) / len(comparisons), 3)
                 pairwise = {
                     "scope": "character",
                     "scope_id": character_id,
                     "left_shot_id": left["shot_id"],
                     "right_shot_id": right["shot_id"],
-                    "distance": distance,
-                    "color_distance": round(rgb_mean_distance(left_sig["mean_rgb"], right_sig["mean_rgb"]), 3),
+                    "min_distance": best["distance"],
+                    "min_color_distance": best["color_distance"],
+                    "max_distance": max_distance,
+                    "max_color_distance": max_color_distance,
+                    "avg_distance": avg_distance,
+                    "avg_color_distance": avg_color_distance,
+                    "best_left_frame_index": best["left_frame_index"],
+                    "best_right_frame_index": best["right_frame_index"],
+                    "comparisons": comparisons,
                 }
                 pairwise_checks.append(pairwise)
-                if distance >= VISUAL_SIMILARITY_WARN_THRESHOLD or pairwise["color_distance"] >= 80.0:
+                if max_distance >= VISUAL_SIMILARITY_WARN_THRESHOLD or max_color_distance >= 80.0:
                     issues.append(
                         {
                             "issue_id": f"vcont_{uuid4().hex[:10]}",
@@ -1795,20 +1847,26 @@ def build_visual_continuity_report(root: Path, shot_specs: list[dict[str, Any]])
         if len(entries) < 2:
             continue
         sequence_distances: list[int] = []
+        sequence_color_distances: list[float] = []
         for idx, left in enumerate(entries):
             for right in entries[idx + 1 :]:
-                left_sig = left["signatures"][0]
-                right_sig = right["signatures"][0]
-                distance = hamming_distance(left_sig["hash_bits"], right_sig["hash_bits"])
-                sequence_distances.append(distance)
-        color_distances = [
-            rgb_mean_distance(left["signatures"][0]["mean_rgb"], right["signatures"][0]["mean_rgb"])
-            for idx, left in enumerate(entries)
-            for right in entries[idx + 1 :]
-        ]
+                pair_distances = [
+                    hamming_distance(left_sig["hash_bits"], right_sig["hash_bits"])
+                    for left_sig in left["signatures"]
+                    for right_sig in right["signatures"]
+                ]
+                pair_color_distances = [
+                    rgb_mean_distance(left_sig["mean_rgb"], right_sig["mean_rgb"])
+                    for left_sig in left["signatures"]
+                    for right_sig in right["signatures"]
+                ]
+                sequence_distances.append(min(pair_distances))
+                sequence_color_distances.append(min(pair_color_distances))
+                sequence_distances.append(max(pair_distances))
+                sequence_color_distances.append(max(pair_color_distances))
         if sequence_distances and (
             max(sequence_distances) >= VISUAL_SIMILARITY_WARN_THRESHOLD
-            or (color_distances and max(color_distances) >= 80.0)
+            or (sequence_color_distances and max(sequence_color_distances) >= 80.0)
         ):
             issues.append(
                 {
