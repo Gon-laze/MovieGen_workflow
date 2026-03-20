@@ -1628,3 +1628,63 @@
 
 - 如果继续推进，最自然的是补一组真正的 ffmpeg 参数模板验证
 - 或者给 release 再补 zip 的单独校验文件
+
+## 2026-03-20 Round 32
+
+### 改动
+
+- 把 `post` 从“模板化策略声明”推进到“真实产出处理后媒体”
+- 当前实现支持两条路径：
+  - 若有 `ffmpeg`：走模板对应的 ffmpeg 命令
+  - 若无 `ffmpeg`：走 `file_copy_fallback:<template>`
+- 每个 post candidate 现在都包含：
+  - `source_media_artifact_path`
+  - `media_artifact_path`（处理后媒体）
+  - `post_processing_template`
+  - `post_processing_mode`
+  - `post_processing_status`
+  - `post_processing_details`
+  - `processed_media_probe`
+  - `processed_media_gate`
+- `post` 还会额外登记：
+  - `post_processed_media`
+  - `post_processed_probe`
+  - `post_processed_gate`
+- `assemble/release` 已切换为消费 post 处理后的媒体文件
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 运行 `python -m moviegen.cli doctor`
+  - 确认当前环境：`ffmpeg=false`, `ffprobe=false`
+- 再跑一轮 post -> report：
+  - `python -m moviegen.cli run workspace/review/run_20260319_230220_6f88ecdd__post_project.yaml --stage all --force-stage post --dry-run`
+  - run_id: `run_20260320_000237_9735e324`
+- 检查：
+  - `workspace/post/run_20260320_000237_9735e324__post_summary.json`
+  - `workspace/post/processed/run_20260320_000237_9735e324/`
+  - `workspace/reports/run_20260320_000237_9735e324__delivery_report.json`
+  - `status --run-id run_20260320_000237_9735e324`
+
+### 效果
+
+- `post` 现在已经是真实媒体处理入口，而不是纯排队汇总阶段
+- 当前环境下的实际执行模式已经明确落盘：
+  - `processing_template = normalize_h264_faststart`
+  - `processing_mode = file_copy_fallback:normalize_h264_faststart`
+- `run_20260320_000237_9735e324` 中：
+  - 2 个 approved candidates 全部产出了处理后媒体
+  - 2 组 probe/gate sidecar 全部落盘
+- 后续 `assemble/release` 已真实引用 `workspace/post/processed/...` 下的处理后媒体
+- release 版本继续递增到：
+  - `moviegen_scifi_001__v003__run_20260320_000237_9735e324`
+
+### 问题
+
+- 当前机器缺少 `ffmpeg/ffprobe`，因此还没有验证到真实 ffmpeg remux/transcode 分支
+- 处理模板已经成型，但真正的 ffmpeg 参数质量还需要在有 ffmpeg 的环境中再验证一轮
+
+### 下一步
+
+- 如果继续推进，最自然的是验证并固化真实 ffmpeg 模板
+- 或者给 zip 再补一个单独的 zip 校验文件
