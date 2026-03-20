@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
 import yaml
+from PIL import Image
 
 from .models import ORDERED_STAGES, ProjectSpec, Stage
 from .providers import TERMINAL_PROVIDER_STATES, infer_media_extension, resolve_adapter
@@ -500,6 +502,9 @@ def compute_next_release_version(root: Path, project_id: str) -> str:
                 continue
             max_version = max(max_version, int(match.group(1)))
     return f"v{max_version + 1:03d}"
+
+
+VISUAL_SIMILARITY_WARN_THRESHOLD = 10
 
 
 def build_ffmpeg_post_command(spec: ProjectSpec, source_media_path: Path, processed_path: Path) -> list[str]:
@@ -1649,8 +1654,167 @@ def normalize_str_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def classify_image_path(path: Path) -> bool:
+    return path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def resolve_existing_image_paths(root: Path, refs: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for ref in refs:
+        candidate = Path(ref)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        if candidate.exists() and candidate.is_file() and classify_image_path(candidate):
+            paths.append(candidate)
+    return paths
+
+
+def compute_image_signature(path: Path) -> dict[str, Any] | None:
+    try:
+        with Image.open(path) as img:
+            rgb = img.convert("RGB").resize((32, 32))
+            gray = img.convert("L").resize((8, 8))
+            gray_arr = np.asarray(gray, dtype=np.float32)
+            rgb_arr = np.asarray(rgb, dtype=np.float32)
+        mean = float(gray_arr.mean())
+        bits = (gray_arr > mean).astype(np.uint8).flatten().tolist()
+        return {
+            "path": str(path),
+            "hash_bits": bits,
+            "mean_rgb": rgb_arr.mean(axis=(0, 1)).round(3).tolist(),
+            "width": int(rgb_arr.shape[1]),
+            "height": int(rgb_arr.shape[0]),
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def hamming_distance(bits_a: list[int], bits_b: list[int]) -> int:
+    return sum(int(a != b) for a, b in zip(bits_a, bits_b, strict=False))
+
+
+def rgb_mean_distance(rgb_a: list[float], rgb_b: list[float]) -> float:
+    arr_a = np.asarray(rgb_a, dtype=np.float32)
+    arr_b = np.asarray(rgb_b, dtype=np.float32)
+    return float(np.linalg.norm(arr_a - arr_b))
+
+
+def build_visual_continuity_report(root: Path, shot_specs: list[dict[str, Any]]) -> dict[str, Any]:
+    shot_images: dict[str, list[dict[str, Any]]] = {}
+    skipped_shots: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    sequence_index: dict[str, list[dict[str, Any]]] = {}
+    character_index: dict[str, list[dict[str, Any]]] = {}
+
+    for shot in shot_specs:
+        shot_id = str(shot["shot_id"])
+        refs = normalize_str_list(((shot.get("references", {}) or {}).get("image_refs")))
+        image_paths = resolve_existing_image_paths(root, refs)
+        if not image_paths:
+            skipped_shots.append(
+                {
+                    "shot_id": shot_id,
+                    "reason": "missing_image_refs",
+                }
+            )
+            continue
+        signatures = [signature for signature in (compute_image_signature(path) for path in image_paths) if signature]
+        if not signatures:
+            skipped_shots.append(
+                {
+                    "shot_id": shot_id,
+                    "reason": "image_signature_failed",
+                }
+            )
+            continue
+        entry = {
+            "shot_id": shot_id,
+            "sequence_id": str(shot.get("sequence_id") or ""),
+            "character_ids": normalize_str_list(((shot.get("continuity", {}) or {}).get("character_ids"))),
+            "signatures": signatures,
+        }
+        shot_images[shot_id] = signatures
+        sequence_index.setdefault(entry["sequence_id"], []).append(entry)
+        for character_id in entry["character_ids"]:
+            character_index.setdefault(character_id, []).append(entry)
+
+    pairwise_checks: list[dict[str, Any]] = []
+    for character_id, entries in sorted(character_index.items()):
+        if len(entries) < 2:
+            continue
+        for idx, left in enumerate(entries):
+            for right in entries[idx + 1 :]:
+                left_sig = left["signatures"][0]
+                right_sig = right["signatures"][0]
+                distance = hamming_distance(left_sig["hash_bits"], right_sig["hash_bits"])
+                pairwise = {
+                    "scope": "character",
+                    "scope_id": character_id,
+                    "left_shot_id": left["shot_id"],
+                    "right_shot_id": right["shot_id"],
+                    "distance": distance,
+                    "color_distance": round(rgb_mean_distance(left_sig["mean_rgb"], right_sig["mean_rgb"]), 3),
+                }
+                pairwise_checks.append(pairwise)
+                if distance >= VISUAL_SIMILARITY_WARN_THRESHOLD or pairwise["color_distance"] >= 80.0:
+                    issues.append(
+                        {
+                            "issue_id": f"vcont_{uuid4().hex[:10]}",
+                            "severity": "warn",
+                            "scope": "character",
+                            "scope_id": character_id,
+                            "issue_type": "visual_character_similarity_low",
+                            "message": f"{character_id} has visually divergent references between {left['shot_id']} and {right['shot_id']}",
+                        }
+                    )
+
+    for sequence_id, entries in sorted(sequence_index.items()):
+        if len(entries) < 2:
+            continue
+        sequence_distances: list[int] = []
+        for idx, left in enumerate(entries):
+            for right in entries[idx + 1 :]:
+                left_sig = left["signatures"][0]
+                right_sig = right["signatures"][0]
+                distance = hamming_distance(left_sig["hash_bits"], right_sig["hash_bits"])
+                sequence_distances.append(distance)
+        color_distances = [
+            rgb_mean_distance(left["signatures"][0]["mean_rgb"], right["signatures"][0]["mean_rgb"])
+            for idx, left in enumerate(entries)
+            for right in entries[idx + 1 :]
+        ]
+        if sequence_distances and (
+            max(sequence_distances) >= VISUAL_SIMILARITY_WARN_THRESHOLD
+            or (color_distances and max(color_distances) >= 80.0)
+        ):
+            issues.append(
+                {
+                    "issue_id": f"vcont_{uuid4().hex[:10]}",
+                    "severity": "warn",
+                    "scope": "sequence",
+                    "scope_id": sequence_id,
+                    "issue_type": "visual_sequence_similarity_low",
+                    "message": f"{sequence_id} has visually divergent shot references",
+                }
+            )
+
+    return {
+        "available_shot_images": len(shot_images),
+        "pairwise_checks": pairwise_checks,
+        "issues": issues,
+        "skipped_shots": skipped_shots,
+        "counts": {
+            "shots_with_images": len(shot_images),
+            "pairwise_checks": len(pairwise_checks),
+            "issues": len(issues),
+            "skipped_shots": len(skipped_shots),
+        },
+    }
+
+
 def build_continuity_report(
     *,
+    root: Path,
     run_id: str,
     shot_specs: list[dict[str, Any]],
     review_records: list[dict[str, Any]],
@@ -1822,18 +1986,23 @@ def build_continuity_report(
                 }
             )
 
+    visual_report = build_visual_continuity_report(root, shot_specs)
+    issues.extend(visual_report["issues"])
     return {
         "continuity_id": f"continuity_{uuid4().hex[:12]}",
         "run_id": run_id,
         "shot_contexts": shot_contexts,
         "sequence_summaries": sequence_summaries,
         "character_summaries": character_summaries,
+        "visual_checks": visual_report,
         "issues": issues,
         "counts": {
             "shots": len(shot_contexts),
             "sequences": len(sequence_summaries),
             "characters": len(character_summaries),
             "issues": len(issues),
+            "visual_issues": len(visual_report["issues"]),
+            "visual_skipped_shots": len(visual_report["skipped_shots"]),
         },
         "created_at": now_iso(),
     }
@@ -2034,6 +2203,7 @@ def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             approved_candidates.append(record)
 
     continuity_report = build_continuity_report(
+        root=ctx.root,
         run_id=ctx.run_id,
         shot_specs=shot_specs,
         review_records=review_candidates + regenerate_candidates + approved_candidates,
@@ -2069,7 +2239,12 @@ def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         record["continuity_issue_types"] = issue_types
         record["continuity_issue_count"] = len(shot_issues)
 
-        severe_types = {"character_provider_mixture", "sequence_provider_mixture"}
+        severe_types = {
+            "character_provider_mixture",
+            "sequence_provider_mixture",
+            "visual_character_similarity_low",
+            "visual_sequence_similarity_low",
+        }
         if any(issue_type in severe_types for issue_type in issue_types):
             record["decision"] = "review"
             record["route_back_stage"] = "review"
@@ -2146,6 +2321,8 @@ def stage_review(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         "issue_count": continuity_report["counts"]["issues"],
         "sequence_count": continuity_report["counts"]["sequences"],
         "character_count": continuity_report["counts"]["characters"],
+        "visual_issue_count": continuity_report["counts"]["visual_issues"],
+        "visual_skipped_shots": continuity_report["counts"]["visual_skipped_shots"],
         "top_issue_types": sorted({issue["issue_type"] for issue in continuity_report["issues"]}),
     }
     out = ctx.root / "workspace" / "review" / f"{ctx.run_id}__review_summary.json"
@@ -2527,6 +2704,7 @@ def stage_report(ctx: RunContext, spec: ProjectSpec) -> StageResult:
             "timeline_items": len(timeline_manifest.get("timeline_items", [])),
             "post_candidates": len(post_summary.get("post_candidates", []) or []),
             "continuity_issues": len(continuity_summary.get("issues", []) or []),
+            "visual_continuity_issues": len(((continuity_summary.get("visual_checks") or {}).get("issues") or [])),
         },
         "continuity_summary": continuity_summary.get("counts"),
         "deliverables": deliverables,

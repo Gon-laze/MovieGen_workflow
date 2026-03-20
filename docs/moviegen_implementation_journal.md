@@ -2060,3 +2060,67 @@
 - 当前如果继续推进，最自然的下一步是：
   - 视觉级 continuity 检查
   - 或 continuity-aware live fallback
+
+## 2026-03-21 Round 41
+
+### 改动
+
+- 为 continuity 增加最小可用的“视觉级连续性检查”增强项
+- 新增图像签名与对比：
+  - `hash_bits`（灰度平均哈希）
+  - `mean_rgb`
+  - `color_distance`
+- 视觉连续性现在会写入 `continuity_report.visual_checks`
+  - `available_shot_images`
+  - `pairwise_checks`
+  - `issues`
+  - `skipped_shots`
+- 视觉 issue 会并入 continuity 总问题列表
+  - `visual_character_similarity_low`
+  - `visual_sequence_similarity_low`
+- `review_summary.continuity_summary` 现在额外包含：
+  - `visual_issue_count`
+  - `visual_skipped_shots`
+- `delivery_report.counts` 现在额外包含：
+  - `visual_continuity_issues`
+
+### 验证
+
+- 默认配置验证：
+  - run_id: `run_20260321_000755_f90695ea`
+  - 结果：无图片引用，`visual_checks.skipped_shots = 3`
+- 强对比图片验证：
+  - 使用 `tmp/visual_refs_strong/char_black.png` 与 `char_white.png`
+  - 配置 `tmp/visual_strong_project.yaml`
+  - run_id: `run_20260321_001111_c8dc98b3`
+- 检查：
+  - `workspace/review/run_20260321_001111_c8dc98b3__continuity_report.json`
+  - `workspace/review/run_20260321_001111_c8dc98b3__review_summary.json`
+  - `status --run-id run_20260321_001111_c8dc98b3`
+
+### 效果
+
+- 视觉连续性检查现在已经能在“有图像参考”时真实工作，而不是只会 skipped
+- 在 `run_20260321_001111_c8dc98b3` 中：
+  - `visual_issue_count = 2`
+  - 识别出：
+    - `visual_character_similarity_low`
+    - `visual_sequence_similarity_low`
+  - 对应 pairwise 检查中：
+    - `distance = 0`
+    - `color_distance = 441.673`
+- 这也说明视觉检查现在不是只靠 hash，而是结合了颜色距离
+- 视觉 issue 已真实影响 review 分流：
+  - `review_candidates = 2`
+  - `approved_candidates = 0`
+  - `decision_reasons` 已含 `continuity_issue:visual_*`
+
+### 问题
+
+- 当前视觉连续性仍基于静态参考图，而不是从真实视频帧中提取视觉特征
+- 如果后续要更进一步，仍需要视频帧级比较或更强视觉模型支持
+
+### 下一步
+
+- 如果继续推进，最自然的是做视频帧级 visual continuity 检查
+- 或者把视觉 continuity 风险继续接到 rerun/provider reroute 逻辑里
