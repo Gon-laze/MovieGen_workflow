@@ -135,6 +135,50 @@ def load_structured_file(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def normalize_str_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in {None, ""}]
+    if value in {None, ""}:
+        return []
+    return [str(value)]
+
+
+def build_provider_score_indexes(shot_specs: list[dict[str, object]], review_payload: dict[str, object]) -> dict[str, dict[str, float]]:
+    shot_meta = {str(shot.get("shot_id")): shot for shot in shot_specs}
+    shot_scores: dict[str, dict[str, float]] = {}
+    sequence_scores: dict[str, dict[str, float]] = {}
+    character_scores: dict[str, dict[str, float]] = {}
+    for section in ("review_candidates", "regenerate_candidates", "approved_candidates"):
+        for item in review_payload.get(section, []) or []:
+            shot_id = str(item.get("shot_id"))
+            provider = str(item.get("provider"))
+            score = float(item.get("weighted_total_score") or 0.0)
+            shot_scores.setdefault(shot_id, {})
+            shot_scores[shot_id][provider] = shot_scores[shot_id].get(provider, 0.0) + score
+
+            shot = shot_meta.get(shot_id, {})
+            sequence_id = str(shot.get("sequence_id") or "")
+            if sequence_id:
+                sequence_scores.setdefault(sequence_id, {})
+                sequence_scores[sequence_id][provider] = sequence_scores[sequence_id].get(provider, 0.0) + score
+
+            continuity = shot.get("continuity", {}) or {}
+            for character_id in normalize_str_list(continuity.get("character_ids")):
+                character_scores.setdefault(character_id, {})
+                character_scores[character_id][provider] = character_scores[character_id].get(provider, 0.0) + score
+    return {
+        "shot": shot_scores,
+        "sequence": sequence_scores,
+        "character": character_scores,
+    }
+
+
+def choose_provider_by_score(scores: dict[str, float], fallback_provider: str) -> str:
+    if not scores:
+        return fallback_provider
+    return sorted(scores.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
 def write_run_artifacts(root: Path, run_id: str, summary: dict[str, object]) -> tuple[Path, Path]:
     reports_dir = root / "workspace" / "reports"
     summary_path = reports_dir / f"{run_id}__run_summary.json"
@@ -441,6 +485,7 @@ def resume(
     source_project_file = Path(str(row["project_file"]))
     if not source_project_file.is_absolute():
         source_project_file = root / source_project_file
+    source_spec = load_project_spec(source_project_file)
     project_payload = yaml.safe_load(source_project_file.read_text(encoding="utf-8")) or {}
     planning = project_payload.setdefault("planning", {})
     followup_payloads: dict[str, object] = {}
@@ -468,6 +513,71 @@ def resume(
                 )
             )
             return
+
+        continuity_report_path = root / "workspace" / "review" / f"{run_id}__continuity_report.json"
+        continuity_payload = {}
+        if continuity_report_path.exists():
+            continuity_payload = json.loads(continuity_report_path.read_text(encoding="utf-8"))
+        continuity_issue_index: dict[str, list[dict[str, object]]] = {}
+        for issue in continuity_payload.get("issues", []) or []:
+            scope_id = str(issue.get("scope_id") or "")
+            if scope_id:
+                continuity_issue_index.setdefault(scope_id, []).append(issue)
+        provider_score_indexes = build_provider_score_indexes(shot_specs, review_payload)
+        primary_provider = source_spec.execution.primary_provider
+        known_providers = set(
+            source_spec.providers.preferred_a_pool
+            + source_spec.providers.preferred_b_pool
+            + source_spec.providers.preferred_c_pool
+        )
+        for shot in filtered_shots:
+            shot_id = str(shot.get("shot_id"))
+            sequence_id = str(shot.get("sequence_id") or "")
+            continuity = shot.get("continuity", {}) or {}
+            character_ids = normalize_str_list(continuity.get("character_ids"))
+            issue_types = {str(issue.get("issue_type")) for issue in continuity_issue_index.get(shot_id, [])}
+            issue_types.update(str(issue.get("issue_type")) for issue in continuity_issue_index.get(sequence_id, []))
+            for character_id in character_ids:
+                issue_types.update(str(issue.get("issue_type")) for issue in continuity_issue_index.get(character_id, []))
+            continuity_mixture_types = {
+                "shot_provider_mixture",
+                "sequence_provider_mixture",
+                "character_provider_mixture",
+            }
+            if not issue_types.intersection(continuity_mixture_types):
+                continue
+
+            candidate_scores: dict[str, float] = {}
+            candidate_scores.update(provider_score_indexes["shot"].get(shot_id, {}))
+            for provider, score in provider_score_indexes["sequence"].get(sequence_id, {}).items():
+                candidate_scores[provider] = candidate_scores.get(provider, 0.0) + score
+            for character_id in character_ids:
+                for provider, score in provider_score_indexes["character"].get(character_id, {}).items():
+                    candidate_scores[provider] = candidate_scores.get(provider, 0.0) + score
+            preferred_provider = choose_provider_by_score(candidate_scores, primary_provider)
+            constraints = dict(shot.get("provider_constraints", {}) or {})
+            constraints["allowed_providers"] = [preferred_provider]
+            constraints["banned_providers"] = sorted(
+                provider
+                for provider in known_providers
+                if provider != preferred_provider
+            )
+            constraints["preferred_first_tier"] = True
+            constraints["continuity_reroute_reason"] = sorted(issue_types)
+            constraints["continuity_preferred_provider"] = preferred_provider
+            shot["provider_constraints"] = constraints
+
+        continuity_reroutes = [
+            {
+                "shot_id": str(shot.get("shot_id")),
+                "allowed_providers": (shot.get("provider_constraints", {}) or {}).get("allowed_providers", []),
+                "continuity_preferred_provider": (shot.get("provider_constraints", {}) or {}).get("continuity_preferred_provider"),
+                "continuity_reroute_reason": (shot.get("provider_constraints", {}) or {}).get("continuity_reroute_reason", []),
+            }
+            for shot in filtered_shots
+            if (shot.get("provider_constraints", {}) or {}).get("continuity_preferred_provider")
+        ]
+        resume_plan["continuity_reroutes"] = continuity_reroutes
 
         rerun_followup_run_id = make_run_id()
         resume_shots_path = root / "workspace" / "review" / f"{rerun_followup_run_id}__resume_shot_specs.yaml"

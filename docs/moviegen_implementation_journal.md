@@ -1893,3 +1893,60 @@
 
 - 如果继续推进，最自然的是把 continuity 风险继续接到 router/provider 约束上
 - 或者开始补视觉级 continuity 检查
+
+## 2026-03-20 Round 37
+
+### 改动
+
+- 把 continuity 风险继续往前接到 rerun 执行层
+- `resume` 现在会在 continuity 触发 rerun 时，自动给目标 shot 写入 `provider_constraints`
+  - `allowed_providers = [continuity_preferred_provider]`
+  - `banned_providers = all_known_providers - preferred`
+  - `continuity_reroute_reason`
+  - `continuity_preferred_provider`
+- provider 选择依据来自：
+  - shot 级 score
+  - sequence 级 score
+  - character 级 score
+  - 若不足则回退到 `execution.primary_provider`
+- `resume_plan.json` 现在会写出 `continuity_reroutes`
+- `route` 现在真正尊重 `provider_constraints`
+  - `compile-prompts` 与 `route` 已统一使用同一套 provider chain 解析
+- `route_plan.selected_reason` 现在会明确标示：
+  - `continuity_reroute:<provider>`
+  - 或 `provider_constraints:*`
+  - 不再全部伪装成普通 `route_matrix:*`
+
+### 验证
+
+- 修复 `resume` 中 `normalize_str_list()` 的 list 判断 bug 后重新验证
+- 对 source run：`run_20260320_234927_21968fc9`
+  - 先将 `gate_3_review` 改为 `approved`
+  - 再运行 `python -m moviegen.cli resume --run-id run_20260320_234927_21968fc9 --dry-run`
+- 结果：
+  - follow-up rerun run: `run_20260320_235622_942f0582`
+- 检查：
+  - `workspace/review/run_20260320_234927_21968fc9__resume_plan.json`
+  - `workspace/review/run_20260320_235622_942f0582__resume_shot_specs.yaml`
+  - `workspace/reports/run_20260320_235622_942f0582__route_plan.json`
+
+### 效果
+
+- continuity 风险现在已经能真实影响 rerun 的 provider 选择，而不是只影响 review 阶段说明
+- 在本轮验证中：
+  - rerun shot 为 `SHOT_001`、`SHOT_002`
+  - 两个 shot 都被 continuity 策略约束到：
+    - `allowed_providers = [seedance_2_0]`
+  - rerun follow-up 的 `route_plan` 也已经真实只生成 `seedance_2_0` job
+- `route_plan.selected_reason` 已显示：
+  - `continuity_reroute:seedance_2_0`
+
+### 问题
+
+- continuity reroute 当前仍是规则式 provider 收敛，不是视觉级一致性驱动的 provider 选择
+- 当前 gate 的 approve/reject 语义仍偏“工程执行层”，未来若要更细，还需要把 review 动作类型再拆分
+
+### 下一步
+
+- 如果继续推进，最自然的是开始做视觉级 continuity 检查
+- 或者把 continuity reroute 进一步接到 `generate` 阶段的 fallback 逻辑

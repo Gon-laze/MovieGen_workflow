@@ -957,7 +957,7 @@ def stage_compile_prompts(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     packets: list[dict[str, Any]] = []
     for shot in shot_specs:
         archetype = shot.get("archetype", "insert_cutaway")
-        provider_chain = shot.get("provider_constraints", {}).get("allowed_providers") or spec.routing.route_matrix.get(archetype, spec.providers.preferred_c_pool)
+        provider_chain = resolve_provider_chain_for_shot(spec, shot)
         for provider in provider_chain[:3]:
             packet = {
                 "packet_id": f"packet_{uuid4().hex[:12]}",
@@ -1030,7 +1030,16 @@ def stage_route(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     for shot in shot_specs:
         shot_id = shot["shot_id"]
         archetype = shot.get("archetype", "insert_cutaway")
-        provider_chain = spec.routing.route_matrix.get(archetype, spec.providers.preferred_c_pool)
+        provider_chain = resolve_provider_chain_for_shot(spec, shot)
+        constraints = shot.get("provider_constraints", {}) or {}
+        if constraints.get("continuity_preferred_provider"):
+            selected_reason = f"continuity_reroute:{constraints['continuity_preferred_provider']}"
+        elif normalize_str_list(constraints.get("allowed_providers")):
+            selected_reason = "provider_constraints:allowed_providers"
+        elif normalize_str_list(constraints.get("banned_providers")):
+            selected_reason = "provider_constraints:banned_providers"
+        else:
+            selected_reason = f"route_matrix:{archetype}"
         for rank, provider in enumerate(provider_chain[:2], start=1):
             job_id = f"job_{uuid4().hex[:12]}"
             provider_model = provider
@@ -1042,7 +1051,7 @@ def stage_route(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                 "provider": provider,
                 "provider_model": provider_model,
                 "provider_rank": rank,
-                "selected_reason": f"route_matrix:{archetype}",
+                "selected_reason": selected_reason,
                 "archetype": archetype,
                 "grade": shot.get("grade", "B"),
                 "budget_class": shot.get("budget_class", "standard"),
@@ -1848,6 +1857,22 @@ def resolve_existing_file_path(value: Any) -> Path | None:
     if path.exists() and path.is_file():
         return path
     return None
+
+
+def resolve_provider_chain_for_shot(spec: ProjectSpec, shot: dict[str, Any]) -> list[str]:
+    archetype = shot.get("archetype", "insert_cutaway")
+    constraints = shot.get("provider_constraints", {}) or {}
+    allowed = normalize_str_list(constraints.get("allowed_providers"))
+    banned = set(normalize_str_list(constraints.get("banned_providers")))
+    if allowed:
+        chain = [provider for provider in allowed if provider not in banned]
+    else:
+        chain = [provider for provider in spec.routing.route_matrix.get(archetype, spec.providers.preferred_c_pool) if provider not in banned]
+        if constraints.get("preferred_first_tier"):
+            first_tier = [provider for provider in spec.benchmark.must_test if provider in chain]
+            remainder = [provider for provider in chain if provider not in first_tier]
+            chain = first_tier + remainder
+    return chain
 
 
 def stage_judge(ctx: RunContext, spec: ProjectSpec) -> StageResult:
