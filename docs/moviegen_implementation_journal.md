@@ -2364,3 +2364,27 @@
 
 - 如果继续推进，最自然的是把视觉 continuity 风险也接到 rerun/provider reroute
 - 或继续把视频时序 continuity 检查做得更密
+
+## 2026-03-21 Round 46
+
+### 当前验证结论
+
+- 视觉连续性检查已经可以真实影响 `review` 分流
+- 在多帧视频参考样例 `run_20260321_001842_b607611f` 中：
+  - `visual_character_similarity_low`
+  - `visual_sequence_similarity_low`
+  已真实触发
+- 当前这两类视觉 issue 会把候选压到：
+  - `decision = review`
+  - `route_back_stage = review`
+- 但它们尚未进一步接入 `resume` 的 reroute 约束逻辑
+  - 也就是说，目前视觉连续性风险能影响 review
+  - 但还不会自动收敛 rerun 的 provider 选择
+
+### 下一步建议
+
+- 如果继续推进，最直接的下一步是把：
+  - `visual_character_similarity_low`
+  - `visual_sequence_similarity_low`
+  一并纳入 `resume` 的 continuity reroute 条件
+- 这样视觉连续性风险就会和当前的规则 continuity 一样，真正影响 rerun provider 约束
