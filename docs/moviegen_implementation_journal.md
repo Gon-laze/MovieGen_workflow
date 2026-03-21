@@ -2446,3 +2446,21 @@
 
 - 如果继续推进，最自然的是把视觉 continuity 检查进一步接到 ingest 产出的 keyframes/style refs 上
 - 或者补更正式的 shot segmentation / keyframe extraction 策略
+
+## 2026-03-21 Round 48
+
+### 修复
+
+- 修正一个遗留差异：
+  - `resume` 的 continuity reroute 条件现在已**显式**包含：
+    - `visual_character_similarity_low`
+    - `visual_sequence_similarity_low`
+- 这意味着视觉连续性风险在语义上也被正式纳入 reroute 触发条件，
+  而不只是依赖同时存在的 provider mixture 问题去间接命中
+
+### 当前判断
+
+- 现在 continuity reroute 触发集合已经完整覆盖：
+  - provider mixture
+  - sequence/provider divergence
+  - 视觉级 character/sequence similarity low

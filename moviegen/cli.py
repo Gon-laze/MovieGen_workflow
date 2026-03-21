@@ -530,6 +530,8 @@ def resume(
                 "shot_provider_mixture",
                 "sequence_provider_mixture",
                 "character_provider_mixture",
+                "visual_character_similarity_low",
+                "visual_sequence_similarity_low",
             }
             if not issue_types.intersection(continuity_mixture_types):
                 continue
