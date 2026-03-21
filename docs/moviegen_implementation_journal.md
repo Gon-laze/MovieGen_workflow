@@ -2388,3 +2388,61 @@
   - `visual_sequence_similarity_low`
   一并纳入 `resume` 的 continuity reroute 条件
 - 这样视觉连续性风险就会和当前的规则 continuity 一样，真正影响 rerun provider 约束
+
+## 2026-03-21 Round 47
+
+### 改动
+
+- 补强 `Reference Ingest` 的真实派生产物能力
+- `stage_ingest` 现在除了扫描 `references.*` 目录，还会额外读取：
+  - `planning.shot_specs_file`
+  - 并 ingest 其中的：
+    - `references.image_refs`
+    - `references.video_refs`
+    - `references.text_refs`
+- 为支持的参考资产新增最小派生产物：
+  - 图片 -> `workspace/style_refs/`
+  - 视频/GIF -> `workspace/motion_refs/`
+  - 视频/GIF -> `workspace/keyframes/` 多帧关键帧
+- manifest 现在会真实记录：
+  - `derived_exports`
+  - `keyframes`
+  - `num_derived_exports`
+  - `num_keyframes`
+- 修复一个真实 bug：
+  - `.gif` 现在被视作 `video` 资产，而不再是 `unsupported_format`
+
+### 验证
+
+- 运行 `python -m compileall moviegen`
+- 使用 `tmp/visual_video_project.yaml` 单独跑 ingest：
+  - `python -m moviegen.cli run tmp/visual_video_project.yaml --stage ingest --dry-run`
+  - run_id: `run_20260321_113740_d64664cc`
+- 检查：
+  - `workspace/reports/run_20260321_113740_d64664cc__reference_manifest.json`
+  - `workspace/motion_refs/`
+  - `workspace/keyframes/`
+
+### 效果
+
+- `shot_specs` 里的 GIF `video_refs` 现在已经会被正确 ingest，而不再被判为 `unsupported_format`
+- 在 `run_20260321_113740_d64664cc` 中：
+  - `num_videos = 2`
+  - `num_keyframes = 4`
+  - `num_derived_exports = 2`
+- 真实落盘结果已确认：
+  - 2 个 `motion_ref` 文件
+  - 4 个 `keyframe` PNG 文件
+- 这也意味着：
+  - 视觉 continuity 后续可以不只依赖 shot spec 路径本身
+  - ingest 层已经开始真实产出后续可复用的参考派生资产
+
+### 问题
+
+- 当前 keyframe 提取仍是基础版，主要服务于 GIF/可直接解码的视频参考
+- 对真实长视频的切镜和更细的关键帧抽取，后续还需要专门的媒体分段逻辑
+
+### 下一步
+
+- 如果继续推进，最自然的是把视觉 continuity 检查进一步接到 ingest 产出的 keyframes/style refs 上
+- 或者补更正式的 shot segmentation / keyframe extraction 策略

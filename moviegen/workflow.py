@@ -58,7 +58,7 @@ def infer_reference_role(path: Path, asset_type: str) -> str:
 
 def classify_asset(path: Path) -> str | None:
     suffix = path.suffix.lower()
-    if suffix in {".mp4", ".mov", ".webm", ".mkv"}:
+    if suffix in {".mp4", ".mov", ".webm", ".mkv", ".gif"}:
         return "video"
     if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
         return "image"
@@ -663,6 +663,84 @@ def stage_ingest(ctx: RunContext, spec: ProjectSpec, project_file: Path) -> Stag
         handle_path(ctx.root / ref)
     for ref in spec.references.text_notes:
         handle_path(ctx.root / ref)
+    shot_specs_file = spec.planning.shot_specs_file
+    if shot_specs_file:
+        source = ctx.root / shot_specs_file
+        if source.exists():
+            if source.suffix.lower() in {".yaml", ".yml"}:
+                payload = yaml.safe_load(source.read_text(encoding="utf-8")) or []
+            else:
+                payload = json.loads(source.read_text(encoding="utf-8"))
+            shot_specs = payload.get("shot_specs", []) if isinstance(payload, dict) else payload if isinstance(payload, list) else []
+            for shot in shot_specs:
+                references = shot.get("references", {}) or {}
+                for ref in normalize_str_list(references.get("video_refs")):
+                    handle_path(ctx.root / ref)
+                for ref in normalize_str_list(references.get("image_refs")):
+                    handle_path(ctx.root / ref)
+                for ref in normalize_str_list(references.get("text_refs")):
+                    handle_path(ctx.root / ref)
+
+    keyframes: list[dict[str, Any]] = []
+    derived_exports: list[dict[str, Any]] = []
+    for asset in imported_assets:
+        source_path = Path(asset["source_path"])
+        reference_asset_id = asset["reference_asset_id"]
+        role = asset["tags"]["role"]
+        if asset["asset_type"] == "image" and source_path.exists():
+            style_ref_path = ctx.root / "workspace" / "style_refs" / f"{ctx.run_id}__{reference_asset_id}{source_path.suffix.lower()}"
+            shutil.copy2(source_path, style_ref_path)
+            derived_exports.append(
+                {
+                    "reference_asset_id": reference_asset_id,
+                    "derived_type": "style_ref",
+                    "path": str(style_ref_path),
+                    "role": role,
+                }
+            )
+            ctx.record_artifact(
+                path=style_ref_path,
+                artifact_type="style_ref",
+                source_stage=Stage.INGEST.value,
+                source_id=reference_asset_id,
+                retention_policy="keep",
+            )
+        elif asset["asset_type"] == "video" and source_path.exists():
+            motion_ref_path = ctx.root / "workspace" / "motion_refs" / f"{ctx.run_id}__{reference_asset_id}{source_path.suffix.lower()}"
+            shutil.copy2(source_path, motion_ref_path)
+            derived_exports.append(
+                {
+                    "reference_asset_id": reference_asset_id,
+                    "derived_type": "motion_ref",
+                    "path": str(motion_ref_path),
+                    "role": role,
+                }
+            )
+            ctx.record_artifact(
+                path=motion_ref_path,
+                artifact_type="motion_ref",
+                source_stage=Stage.INGEST.value,
+                source_id=reference_asset_id,
+                retention_policy="keep",
+            )
+            for sample_index, (_, image) in enumerate(sample_visual_ref_images(source_path), start=1):
+                keyframe_path = ctx.root / "workspace" / "keyframes" / f"{ctx.run_id}__{reference_asset_id}__frame{sample_index:03d}.png"
+                image.save(keyframe_path)
+                keyframes.append(
+                    {
+                        "reference_asset_id": reference_asset_id,
+                        "frame_index": sample_index,
+                        "path": str(keyframe_path),
+                        "role": role,
+                    }
+                )
+                ctx.record_artifact(
+                    path=keyframe_path,
+                    artifact_type="keyframe",
+                    source_stage=Stage.INGEST.value,
+                    source_id=reference_asset_id,
+                    retention_policy="keep",
+                )
 
     manifest = {
         "manifest_id": f"manifest_{uuid4().hex[:12]}",
@@ -672,15 +750,17 @@ def stage_ingest(ctx: RunContext, spec: ProjectSpec, project_file: Path) -> Stag
         "failed_assets": failed_assets,
         "dedup_groups": [ids for ids in dedup.values() if len(ids) > 1],
         "shot_segments": [],
-        "keyframes": [],
+        "keyframes": keyframes,
+        "derived_exports": derived_exports,
         "stats": {
             "num_videos": sum(1 for a in imported_assets if a["asset_type"] == "video"),
             "num_images": sum(1 for a in imported_assets if a["asset_type"] == "image"),
             "num_text_notes": sum(1 for a in imported_assets if a["asset_type"] == "text"),
             "num_shot_segments": 0,
-            "num_keyframes": 0,
+            "num_keyframes": len(keyframes),
+            "num_derived_exports": len(derived_exports),
         },
-        "implementation_note": "Directory scan, hashing, role inference, and manifest generation implemented. Media segmentation remains pending.",
+        "implementation_note": "Directory scan, hashing, role inference, shot-spec reference ingestion, and basic style_ref/motion_ref/keyframe derivation implemented. Media segmentation remains pending.",
         "created_at": now_iso(),
     }
     pack = {
@@ -711,9 +791,9 @@ def stage_ingest(ctx: RunContext, spec: ProjectSpec, project_file: Path) -> Stag
     ctx.record_artifact(path=manifest_snapshot_path, artifact_type="reference_manifest", source_stage=Stage.INGEST.value)
     ctx.record_artifact(path=pack_snapshot_path, artifact_type="reference_pack", source_stage=Stage.INGEST.value)
     return StageResult(
-        note=f"Imported {len(imported_assets)} reference assets; {len(failed_assets)} inputs could not be imported.",
+        note=f"Imported {len(imported_assets)} reference assets, derived {len(derived_exports)} exports and {len(keyframes)} keyframes; {len(failed_assets)} inputs could not be imported.",
         artifacts=[manifest_path, pack_path, manifest_snapshot_path, pack_snapshot_path],
-        metadata={"imported_count": len(imported_assets), "failed_count": len(failed_assets)},
+        metadata={"imported_count": len(imported_assets), "derived_export_count": len(derived_exports), "keyframe_count": len(keyframes), "failed_count": len(failed_assets)},
     )
 
 
