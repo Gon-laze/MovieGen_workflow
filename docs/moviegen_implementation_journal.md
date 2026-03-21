@@ -2464,3 +2464,61 @@
   - provider mixture
   - sequence/provider divergence
   - 视觉级 character/sequence similarity low
+
+## 2026-03-21 Round 49
+
+### 改动
+
+- 把 `Prompt Compiler` 从通用模板升级为真正的 provider-specific 编译层
+- 新增 provider-specific prompt 生成策略：
+  - `seedance_director_prompt_v1`
+  - `kling_motion_prompt_v1`
+  - `vidu_dialogue_prompt_v1`
+  - `runway_cinematic_prompt_v1`
+  - `veo_descriptive_prompt_v1`
+  - `generic_prompt_v1`
+- packet 现在会针对 provider 生成：
+  - 差异化 `prompt_main`
+  - 差异化 `negative_prompt`
+  - 差异化 `provider_hints`
+  - `compiler_strategy`
+  - `submission_mode_preference`
+  - `reference_strategy`
+  - `compiler_notes`
+- 对 `video_refs` 的 packet 现在会明确偏向：
+  - `submission_mode_preference = video_to_video`
+- 对 `dialogue_native_audio` 场景，`Vidu` packet 会明确偏向：
+  - `submission_mode_preference = audio_video_generation`
+
+### 验证
+
+- 默认样例项目：
+  - `python -m moviegen.cli run config/project.example.yaml --stage all --force-stage plan --dry-run`
+  - run_id: `run_20260321_114251_356ad9ac`
+  - 检查 `workspace/prompts/run_20260321_114251_356ad9ac__prompt_packets.json`
+- 带 `video_refs` 的样例项目：
+  - `python -m moviegen.cli run tmp/visual_video_project.yaml --stage all --force-stage plan --dry-run`
+  - run_id: `run_20260321_114228_b4d3bd6e`
+  - 检查 `workspace/prompts/run_20260321_114228_b4d3bd6e__prompt_packets.json`
+
+### 效果
+
+- 默认样例中，同一 shot 的不同 provider packet 已经明显分化：
+  - `Seedance` 更偏导演式叙事 continuity
+  - `Kling` 更偏 motion/camera control
+  - `Runway` 更偏 cinematic frame sequence
+  - `Vidu` 更偏 dialogue/native audio
+- `video_refs` 样例中，packet 已真实输出：
+  - `submission_mode_preference = video_to_video`
+  - `reference_strategy = multi_ref`
+- `compiler_version` 已从 `v0` 升级到 `v1`
+
+### 问题
+
+- 当前 provider-specific 编译仍是规则式 prompt engineering，不是 learned prompt optimization
+- 但它已经完成了原计划里“统一语义 -> 模型特化 packet”的最小工程化落地
+
+### 下一步
+
+- 如果继续推进，最自然的是把 provider-specific packet 真正接到更多真实 provider adapter
+- 或继续做视觉 continuity -> reroute 的更深联动

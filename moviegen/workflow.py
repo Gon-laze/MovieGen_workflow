@@ -1034,6 +1034,191 @@ def stage_plan(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     return StageResult(note=plan_payload["note"], artifacts=[out], metadata=plan_payload)
 
 
+def normalize_aspect_ratio_value(value: Any) -> str:
+    if value in {None, ""}:
+        return "16:9"
+    text = str(value)
+    if text == "969":
+        return "16:9"
+    return text
+
+
+def compact_parts(parts: list[str]) -> str:
+    return ", ".join(part.strip() for part in parts if part and part.strip())
+
+
+def build_negative_prompt(provider: str, shot: dict[str, Any]) -> str:
+    negatives = [
+        "cartoon look",
+        "anime style",
+        "oversaturated colors",
+        "social video aesthetic",
+        "broken anatomy",
+        "duplicate limbs",
+        "floating objects",
+        "melted hands",
+        "unstable background",
+    ]
+    archetype = str(shot.get("archetype") or "")
+    if archetype == "dialogue_native_audio":
+        negatives.extend(["caption overlay", "subtitle burn-in", "off-camera speaker mismatch"])
+    if archetype == "motion_control":
+        negatives.extend(["camera drift", "pose collapse", "motion smear"])
+    if provider == "seedance_2_0":
+        negatives.extend(["music video pacing", "hyper stylized lighting"])
+    elif provider == "kling_3_0":
+        negatives.extend(["rubbery motion", "excessive speed ramping"])
+    elif provider == "vidu_q3":
+        negatives.extend(["flat dialogue staging", "mouth desync"])
+    elif provider.startswith("runway"):
+        negatives.extend(["AI glossy texture", "overprocessed contrast"])
+    elif provider.startswith("veo"):
+        negatives.extend(["dreamlike surrealism", "implausible physics"])
+    return ", ".join(dict.fromkeys(negatives))
+
+
+def build_provider_prompt_blocks(provider: str, shot: dict[str, Any]) -> tuple[str, dict[str, str], dict[str, Any]]:
+    continuity = shot.get("continuity", {}) or {}
+    continuity_label = compact_parts(
+        [
+            f"character={','.join(normalize_str_list(continuity.get('character_ids')))}" if normalize_str_list(continuity.get("character_ids")) else "",
+            f"wardrobe={','.join(normalize_str_list(continuity.get('wardrobe_ids')))}" if normalize_str_list(continuity.get("wardrobe_ids")) else "",
+            f"location={continuity.get('location_id')}" if continuity.get("location_id") else "",
+            f"props={','.join(normalize_str_list(continuity.get('prop_ids')))}" if normalize_str_list(continuity.get("prop_ids")) else "",
+        ]
+    )
+    base_blocks = {
+        "subject": str(shot.get("subject") or ""),
+        "location": str(shot.get("location") or ""),
+        "action": str(shot.get("action") or ""),
+        "camera": str(shot.get("camera") or ""),
+        "style": str(shot.get("style") or ""),
+        "continuity": continuity_label,
+        "negative_or_avoid": build_negative_prompt(provider, shot),
+        "provider_hints": "",
+    }
+    archetype = str(shot.get("archetype") or "insert_cutaway")
+    needs_native_audio = bool(shot.get("needs_native_audio", False))
+    image_refs = normalize_str_list(((shot.get("references", {}) or {}).get("image_refs")))
+    video_refs = normalize_str_list(((shot.get("references", {}) or {}).get("video_refs")))
+    mode_hint = "image_to_video" if image_refs else "video_to_video" if video_refs else "text_to_video"
+
+    if provider == "seedance_2_0":
+        prompt_main = compact_parts(
+            [
+                "Director-level live-action sci-fi shot",
+                f"narrative purpose={shot.get('story_purpose')}",
+                f"subject={base_blocks['subject']}",
+                f"location={base_blocks['location']}",
+                f"action={base_blocks['action']}",
+                f"camera={base_blocks['camera']}",
+                f"tone={base_blocks['style']}",
+                f"continuity={continuity_label}",
+            ]
+        )
+        base_blocks["provider_hints"] = "seedance:narrative_continuity, controlled blocking, restrained realism"
+        compiler_meta = {
+            "compiler_strategy": "seedance_director_prompt_v1",
+            "submission_mode_preference": mode_hint,
+            "reference_strategy": "multi_ref" if image_refs or video_refs else "text_only",
+            "compiler_notes": ["bias toward multi-shot narrative continuity", "prefer restrained cinematic realism"],
+        }
+    elif provider == "kling_3_0":
+        prompt_main = compact_parts(
+            [
+                "Cinematic live-action sci-fi shot",
+                f"subject={base_blocks['subject']}",
+                f"action={base_blocks['action']}",
+                f"camera_move={base_blocks['camera']}",
+                f"location={base_blocks['location']}",
+                f"look={base_blocks['style']}",
+                f"continuity_anchor={continuity_label}",
+            ]
+        )
+        base_blocks["provider_hints"] = "kling:motion_control, camera discipline, physical timing"
+        compiler_meta = {
+            "compiler_strategy": "kling_motion_prompt_v1",
+            "submission_mode_preference": mode_hint,
+            "reference_strategy": "motion_or_ref" if image_refs or video_refs else "text_only",
+            "compiler_notes": ["bias toward motion control and physical camera behavior"],
+        }
+    elif provider == "vidu_q3":
+        dialogue_hint = "native spoken dialogue" if needs_native_audio else "silent performance"
+        prompt_main = compact_parts(
+            [
+                "Photoreal live-action sci-fi dialogue shot",
+                f"subject={base_blocks['subject']}",
+                f"location={base_blocks['location']}",
+                f"action={base_blocks['action']}",
+                f"camera={base_blocks['camera']}",
+                f"audio_mode={dialogue_hint}",
+                f"continuity={continuity_label}",
+            ]
+        )
+        base_blocks["provider_hints"] = "vidu:dialogue_staging, native_audio, reference_consistency"
+        compiler_meta = {
+            "compiler_strategy": "vidu_dialogue_prompt_v1",
+            "submission_mode_preference": "audio_video_generation" if needs_native_audio else mode_hint,
+            "reference_strategy": "up_to_multi_ref" if image_refs or video_refs else "text_only",
+            "compiler_notes": ["bias toward dialogue clarity and native audio scenes"],
+        }
+    elif provider.startswith("runway"):
+        prompt_main = compact_parts(
+            [
+                "Cinematic live-action science-fiction frame sequence",
+                f"subject={base_blocks['subject']}",
+                f"environment={base_blocks['location']}",
+                f"action={base_blocks['action']}",
+                f"shot_design={base_blocks['camera']}",
+                f"visual_tone={base_blocks['style']}",
+            ]
+        )
+        base_blocks["provider_hints"] = "runway:clean cinematic image-to-video bias, controlled contrast"
+        compiler_meta = {
+            "compiler_strategy": "runway_cinematic_prompt_v1",
+            "submission_mode_preference": mode_hint,
+            "reference_strategy": "image_to_video" if image_refs else "text_only",
+            "compiler_notes": ["bias toward polished cinematic keyframes and image-to-video quality"],
+        }
+    elif provider.startswith("veo"):
+        prompt_main = compact_parts(
+            [
+                "A physically plausible live-action science-fiction shot",
+                f"Subject: {base_blocks['subject']}",
+                f"Location: {base_blocks['location']}",
+                f"Action: {base_blocks['action']}",
+                f"Camera language: {base_blocks['camera']}",
+                f"Look: {base_blocks['style']}",
+                f"Continuity anchors: {continuity_label}",
+            ]
+        )
+        base_blocks["provider_hints"] = "veo:descriptive natural language, physically plausible motion"
+        compiler_meta = {
+            "compiler_strategy": "veo_descriptive_prompt_v1",
+            "submission_mode_preference": mode_hint,
+            "reference_strategy": "descriptive_plus_ref" if image_refs or video_refs else "descriptive_only",
+            "compiler_notes": ["bias toward descriptive natural language and realistic motion"],
+        }
+    else:
+        prompt_main = compact_parts(
+            [
+                base_blocks["subject"],
+                base_blocks["location"],
+                base_blocks["action"],
+                base_blocks["camera"],
+                base_blocks["style"],
+            ]
+        )
+        base_blocks["provider_hints"] = f"generic:{provider}, archetype={archetype}"
+        compiler_meta = {
+            "compiler_strategy": "generic_prompt_v1",
+            "submission_mode_preference": mode_hint,
+            "reference_strategy": "generic_ref" if image_refs or video_refs else "text_only",
+            "compiler_notes": ["generic fallback compiler path"],
+        }
+    return prompt_main, base_blocks, compiler_meta
+
+
 def stage_compile_prompts(ctx: RunContext, spec: ProjectSpec) -> StageResult:
     shot_plan_path = ctx.root / "workspace" / "reports" / f"{ctx.run_id}__shot_plan.json"
     shot_specs: list[dict[str, Any]] = []
@@ -1045,31 +1230,15 @@ def stage_compile_prompts(ctx: RunContext, spec: ProjectSpec) -> StageResult:
         archetype = shot.get("archetype", "insert_cutaway")
         provider_chain = resolve_provider_chain_for_shot(spec, shot)
         for provider in provider_chain[:3]:
+            prompt_main, prompt_blocks, compiler_meta = build_provider_prompt_blocks(provider, shot)
             packet = {
                 "packet_id": f"packet_{uuid4().hex[:12]}",
                 "shot_id": shot["shot_id"],
                 "provider": provider,
                 "provider_model": provider,
-                "prompt_main": " | ".join(
-                    [
-                        shot.get("subject", ""),
-                        shot.get("location", ""),
-                        shot.get("action", ""),
-                        shot.get("camera", ""),
-                        shot.get("style", ""),
-                    ]
-                ).strip(" |"),
-                "prompt_blocks": {
-                    "subject": shot.get("subject", ""),
-                    "location": shot.get("location", ""),
-                    "action": shot.get("action", ""),
-                    "camera": shot.get("camera", ""),
-                    "style": shot.get("style", ""),
-                    "continuity": json.dumps(shot.get("continuity", {}), ensure_ascii=False),
-                    "negative_or_avoid": "",
-                    "provider_hints": f"archetype={archetype}",
-                },
-                "negative_prompt": None,
+                "prompt_main": prompt_main,
+                "prompt_blocks": prompt_blocks,
+                "negative_prompt": prompt_blocks["negative_or_avoid"],
                 "reference_assets": {
                     "image_refs": shot.get("references", {}).get("image_refs", []),
                     "video_refs": shot.get("references", {}).get("video_refs", []),
@@ -1083,7 +1252,8 @@ def stage_compile_prompts(ctx: RunContext, spec: ProjectSpec) -> StageResult:
                     "motion_control_mode": "video_drive" if shot.get("needs_motion_control", False) else "none",
                 },
                 "retry_context": {"retry_count": 0, "prior_fail_reasons": []},
-                "compiler_version": "v0",
+                "compiler_version": "v1",
+                **compiler_meta,
             }
             packets.append(packet)
 
